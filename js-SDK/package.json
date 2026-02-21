@@ -1,0 +1,56 @@
+{
+  "name": "edge-glasses",
+  "version": "1.0.0",
+  "description": "JavaScript/TypeScript SDK for EDGE Smart Glasses",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "lint": "eslint src/",
+    "test": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ble",
+    "bluetooth",
+    "web-bluetooth",
+    "glasses",
+    "meditation",
+    "neurofeedback",
+    "openbci",
+    "eeg",
+    "biofeedback"
+  ],
+  "author": "EDGE Technologies",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/edge-glasses/edge-glasses-js.git"
+  },
+  "homepage": "https://github.com/edge-glasses/edge-glasses-js#readme",
+  "bugs": {
+    "url": "https://github.com/edge-glasses/edge-glasses-js/issues"
+  },
+  "devDependencies": {
+    "@types/web-bluetooth": "^0.0.20",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
