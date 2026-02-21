@@ -29,7 +29,7 @@ EDGE glasses feature LCD lenses that dynamically change opacity via Bluetooth. A
 ### Why EDGE?
 
 - **Open Protocol** — Simple BLE API, no vendor lock-in
-- **Low Latency** — <100ms · tested at 10ms intervals (100 Hz)
+- **Low Latency** — 20+ Hz update rate for real-time feedback
 - **Cross-Platform SDKs** — Python for research, JS for web apps
 - **Sensor Agnostic** — Works with any biosignal source via LSL/brainflow
 - **Research Ready** — Compatible with OpenBCI, Muse, Polar, and lab equipment
@@ -87,7 +87,14 @@ await glasses.sessionMeditate(10);
 
 ## Integrations
 
-Works with popular biosignal platforms and research equipment:
+Works with popular biosignal platforms and research equipment. Your computer runs the SDK, which bridges between sensor data (LSL/BLE/USB) and the glasses (BLE).
+
+```
+┌─────────────┐      LSL/USB/BLE      ┌─────────────┐       BLE        ┌─────────────┐
+│   Sensor    │ ──────────────────▶   │  Computer   │ ───────────────▶ │   Glasses   │
+│ (EEG/HRV/…) │                       │ (Python SDK)│                  │   (ESP32)   │
+└─────────────┘                       └─────────────┘                  └─────────────┘
+```
 
 ### Consumer Devices
 | Platform | Signals | Connection |
