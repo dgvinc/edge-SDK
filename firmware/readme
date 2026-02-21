@@ -1,0 +1,52 @@
+# EDGE Glasses Firmware
+
+ESP32 firmware for EDGE Smart LCD Glasses.
+
+## Features
+
+- BLE GATT server for wireless control
+- Timed meditation sessions with breathing patterns
+- Strobe frequency control (1-50 Hz)
+- Hall sensor sleep/wake detection
+- Power optimized (~29mA active, ~16µA sleep)
+
+## Hardware
+
+- MCU: ESP32-PICO-D4
+- PWM Output: GPIO27
+- Hall Sensor: GPIO4
+- BLE Service: 0x00FF
+
+## Build
+
+Requires ESP-IDF v5.x
+
+\`\`\`bash
+idf.py set-target esp32
+idf.py build
+idf.py -p /dev/ttyUSB0 flash monitor
+\`\`\`
+
+## BLE Protocol
+
+See [API Reference](docs/API_REFERENCE.md) for complete command documentation.
+
+### Quick Reference
+
+| Bytes | Action |
+|-------|--------|
+| `[0x00-0xFF]` | Set opacity (single byte) |
+| `[0xA1, start, end]` | Set strobe Hz range |
+| `[0xA2, percent]` | Set brightness |
+| `[0xA5, duty]` | Static hold |
+| `[0xA6]` | Resume session |
+| `[0xA7]` | Sleep |
+
+## SDKs
+
+- [Python SDK](https://github.com/edge-glasses/python-sdk)
+- [JavaScript SDK](https://github.com/edge-glasses/js-sdk)
+
+## License
+
+MIT
