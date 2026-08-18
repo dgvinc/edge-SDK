@@ -2,7 +2,7 @@
 
 Complete guide for integrating EDGE Smart Glasses with neurofeedback and biofeedback systems.
 
-**SDK v2.3.0 — firmware 4.15.6+ (lens-config methods need 4.15.7+; battery needs
+**SDK v2.4.0 — firmware 4.15.6+ (lens-config methods need 4.15.7+; battery needs
 4.16.1+); current firmware 4.16.2.** All processing runs app-side: your app
 computes its signal and drives the lens by commanding the firmware's breathe /
 static / strobe renderer. The glasses are a display.
@@ -790,6 +790,7 @@ except ConnectionError:
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.4.0 | Aug 2026 | `FeedbackStream` auto-uses **write-without-response** on fw ≥ 4.16.3 for higher real-time throughput (feature-detected at connect; `supports_fast_write`) |
 | 2.3.0 | Aug 2026 | Firmware 4.16.2 audit: `get_battery()` (0x180F/0x2A19); real-time rate reframe (no 20 Hz ceiling — target 30-50 Hz); FeedbackStream default 30 Hz; timed-fade (0xA1 slew ramp) + jitter-smoothing guidance; 0xA5 no longer touches 0xA2 brightness (fw 4.16.2) |
 | 2.2.0 | Jul 2026 | Lens-config knobs (fw 4.15.7+): `set_lens_smoothing` (0xA0 EMA glide), `set_lens_max_rate` (0xA1 slew cap), `set_disconnect_behavior` (0xA3 fail-clear on link loss) |
 | 2.0.0 | Jul 2026 | Firmware 4.15.6+ API: breathe engine, sync_breath, strobe mode; removed ramping sessions; device name `Narbis_Edge` |

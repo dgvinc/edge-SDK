@@ -83,11 +83,23 @@ class Glasses:
         self._address = address
         self._client: Optional[BleakClient] = None
         self._connected = False
+        self._ctrl_supports_wnr = False  # 0xFF01 write-without-response (fw >= 4.16.3)
 
     @property
     def is_connected(self) -> bool:
         """Check if currently connected"""
         return self._connected and self._client is not None
+
+    @property
+    def supports_fast_write(self) -> bool:
+        """True if the control characteristic advertises write-without-response.
+
+        Firmware >= 4.16.3 exposes write-without-response on 0xFF01, letting
+        the real-time streaming path (FeedbackStream / _stream_static) skip the
+        ATT round-trip per write for higher sustained throughput. Older
+        firmware is write-with-response only, and this stays False.
+        """
+        return self._ctrl_supports_wnr
 
     @property
     def address(self) -> Optional[str]:
@@ -156,6 +168,15 @@ class Glasses:
             self._client = BleakClient(self._address, timeout=timeout)
             await self._client.connect()
             self._connected = True
+            # Detect write-without-response on the control char (fw >= 4.16.3).
+            # When present, the streaming path skips per-write ATT acks.
+            self._ctrl_supports_wnr = False
+            try:
+                ctrl = self._client.services.get_characteristic(CHAR_UUID)
+                if ctrl is not None and "write-without-response" in ctrl.properties:
+                    self._ctrl_supports_wnr = True
+            except Exception:
+                pass
         except BleakError as e:
             raise ConnectionError(
                 f"Failed to connect: {e}. If the glasses have been idle for "
@@ -206,6 +227,26 @@ class Glasses:
 
         try:
             await self._client.write_gatt_char(CHAR_UUID, data, response=True)
+        except BleakError as e:
+            raise CommandError(f"Command failed: {e}")
+
+    async def _stream_static(self, duty: int) -> None:
+        """Fast static-duty write for the real-time streaming path (0xA5).
+
+        Uses write-without-response when the control characteristic advertises
+        it (fw >= 4.16.3), which lifts sustained throughput past the ~20/sec
+        that per-write acks allow; otherwise falls back to write-with-response.
+        Used by FeedbackStream. Command writes (set_static, set_duration, …)
+        keep write-with-response for ordering/back-pressure.
+        """
+        if not self.is_connected:
+            raise ConnectionError("Not connected. Call connect() first.")
+        duty = max(0, min(100, int(duty)))
+        try:
+            await self._client.write_gatt_char(
+                CHAR_UUID, bytes([0xA5, duty]),
+                response=not self._ctrl_supports_wnr,
+            )
         except BleakError as e:
             raise CommandError(f"Command failed: {e}")
 
@@ -780,7 +821,7 @@ class FeedbackStream:
         async with self._lock:              # waits out at most one tick write
             self._last_sent = duty
             try:
-                await self._glasses.set_static(duty)
+                await self._glasses._stream_static(duty)   # fast path (WNR on 4.16.3+)
             except Exception:
                 self._last_sent = -1
         if hold_ms > 0:
@@ -795,7 +836,9 @@ class FeedbackStream:
                 async with self._lock:
                     self._last_sent = duty           # claim before the await
                     try:
-                        await self._glasses.set_static(duty)
+                        # Fast path: write-without-response on fw >= 4.16.3,
+                        # else with-response. Higher sustained throughput.
+                        await self._glasses._stream_static(duty)
                     except Exception:
                         self._last_sent = -1         # failed write: retry next tick
             await asyncio.sleep(self._interval)

@@ -2,7 +2,7 @@
 
 Control EDGE Smart LCD Glasses (`Narbis_Edge`) over Bluetooth Low Energy.
 
-**v2.3.0** — targets glasses firmware 4.15.6+ (lens-config needs 4.15.7+; battery needs 4.16.1+). See the
+**v2.4.0** — targets glasses firmware 4.15.6+ (lens-config needs 4.15.7+; battery needs 4.16.1+). See the
 [migration table](#migrating-from-v1) below.
 
 The glasses are a **display**: all coherence / HRV / biofeedback processing runs in your
@@ -294,7 +294,7 @@ Full method → wire-byte mapping in [docs/API_REFERENCE.md](docs/API_REFERENCE.
 | `await glasses.clear()` | Fully transparent |
 | `await glasses.dark()` | Fully opaque |
 | `await glasses.set_static(0-100)` | Static mode at duty % (fw ≥ 4.16.2: clean static — no longer touches `set_brightness`) |
-| `glasses.start_feedback_stream(rate_hz=30)` | Plug-and-play real-time stream: returns a `FeedbackStream` — `feed(duty)` / `feed_reward(0..1)` for proportional dimming; `await reward_event(duty, hold_ms)` for immediate discrete operant rewards (bypasses the tick); internal writer coalesces + serializes; `await stream.stop()` clears the lens. Default 30 Hz, capped at 45 Hz |
+| `glasses.start_feedback_stream(rate_hz=30)` | Plug-and-play real-time stream: returns a `FeedbackStream` — `feed(duty)` / `feed_reward(0..1)` for proportional dimming; `await reward_event(duty, hold_ms)` for immediate discrete operant rewards (bypasses the tick); internal writer coalesces + serializes; `await stream.stop()` clears the lens. Default 30 Hz, capped at 45 Hz. On fw ≥ 4.16.3 the writer auto-uses write-without-response for higher throughput (`supports_fast_write`) |
 | `await glasses.get_battery()` | Battery level 0-100, or `None` if unavailable (fw ≥ 4.16.1 + V1.2 hardware; reads `0x2A19`). A returned `0` may mean *unknown* on some builds — the `0xFB` status frame carries a true unknown/charging flag |
 | `await glasses.set_brightness(0-100)` | Lens level / breathe depth (persisted; the max-tint that scales breathe & strobe — on fw ≥ 4.16.2 `set_static` no longer writes it, on fw ≤ 4.16.1 they shared one variable) |
 | `await glasses.set_lens_smoothing(ms)` | On-device glide between streamed targets, EMA τ 0-2550 ms, 0 = off (persisted; fw 4.15.7+) |

@@ -7,7 +7,7 @@
  * firmware's breathe / static / strobe renderer.
  *
  * @module edge-glasses
- * @version 2.3.0
+ * @version 2.4.0
  */
 
 // BLE UUIDs
@@ -92,12 +92,38 @@ export class Glasses {
   private server: BluetoothRemoteGATTServer | null = null;
   private characteristic: BluetoothRemoteGATTCharacteristic | null = null;
   private _connected = false;
+  private _ctrlWnr = false;   // 0xFF01 write-without-response (fw >= 4.16.3)
 
   /**
    * Check if currently connected
    */
   get isConnected(): boolean {
     return this._connected && this.server?.connected === true;
+  }
+
+  /**
+   * True if the control characteristic advertises write-without-response.
+   * Firmware >= 4.16.3 exposes it on 0xFF01, letting the streaming path
+   * (FeedbackStream / streamStatic) skip per-write ATT acks for higher
+   * throughput; older firmware is write-with-response only (stays false).
+   */
+  get supportsFastWrite(): boolean {
+    return this._ctrlWnr;
+  }
+
+  /**
+   * Fast static-duty write for the real-time streaming path (0xA5).
+   * Uses write-without-response when 0xFF01 advertises it (fw >= 4.16.3),
+   * else write-with-response. Used by FeedbackStream; command writes keep
+   * write-with-response for ordering/back-pressure.
+   */
+  async streamStatic(duty: number): Promise<void> {
+    if (!this.isConnected || !this.characteristic) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    const buf = new Uint8Array([0xA5, clamp(duty, 0, 100)]);
+    if (this._ctrlWnr) await this.characteristic.writeValueWithoutResponse(buf);
+    else await this.characteristic.writeValueWithResponse(buf);
   }
 
   /**
@@ -148,6 +174,9 @@ export class Glasses {
       // Get service and characteristic
       const service = await this.server.getPrimaryService(SERVICE_UUID);
       this.characteristic = await service.getCharacteristic(CHAR_UUID);
+      // Detect write-without-response on 0xFF01 (fw >= 4.16.3). When present,
+      // the streaming path skips per-write ATT acks for higher throughput.
+      this._ctrlWnr = this.characteristic.properties.writeWithoutResponse === true;
 
       this._connected = true;
 
@@ -707,10 +736,12 @@ export class FeedbackStream {
     if (holdMs > 0) this.holdUntil = Date.now() + holdMs;
   }
 
-  /** Serialized single write: only one setStatic() is ever on the wire. */
+  /** Serialized single write: only one 0xA5 duty write is ever on the wire.
+   *  Uses the fast path (write-without-response on fw >= 4.16.3, else
+   *  with-response); the BLE link layer still guarantees delivery. */
   private doWrite(duty: number): Promise<void> {
     const p = (async () => {
-      try { await this.glasses.setStatic(duty); this.lastSent = duty; }
+      try { await this.glasses.streamStatic(duty); this.lastSent = duty; }
       catch { this.lastSent = -1; }        // failed write: retry next tick
       finally { this.inflight = null; }
     })();

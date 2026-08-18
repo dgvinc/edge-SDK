@@ -293,6 +293,8 @@ Parameters marked "persisted" survive sleep and power cycles (NVS); `0xBF` resto
 | `0xBA` | `sync_breath(cycle_ms, inhale_pct)` | `syncBreath(cycleMs, inhalePct)` |
 | `0xBF` | `factory_reset()` | `factoryReset()` |
 | `0xC7` / `0x2A19` | `get_battery()` → 0-100 or `None` | `getBattery()` → 0-100 or `null` |
+| (WNR fast path) | `supports_fast_write` / `_stream_static()` | `supportsFastWrite` / `streamStatic()` |
+| real-time stream | `start_feedback_stream()` → `FeedbackStream` | `startFeedbackStream()` → `FeedbackStream` |
 | real-time stream | `start_feedback_stream()` → `FeedbackStream` | `startFeedbackStream()` → `FeedbackStream` |
 
 ---

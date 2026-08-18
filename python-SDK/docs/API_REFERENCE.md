@@ -1,7 +1,7 @@
 # EDGE Glasses Python SDK — API Reference
 
 **Firmware 4.15.6+ (lens-config methods need 4.15.7+; battery needs 4.16.1+) — current firmware 4.16.2, August 2026**
-**SDK version:** 2.3.0
+**SDK version:** 2.4.0
 
 This document maps every Python SDK method to the exact bytes it writes over BLE.
 For the full protocol (OTA, status/notify, PPG stream), see the
