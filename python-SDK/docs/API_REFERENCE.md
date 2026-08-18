@@ -80,7 +80,7 @@ the limit, and it depends on the negotiated connection parameters:
 |-----------------------|----------------------|
 | Host accepts the glasses' defaults (20-30 ms interval, slave latency 1) | ~8-11 writes/sec (measured, fw 4.16.2) |
 | Host requests throughput-optimized / low-latency params, held for the session | ~20 writes/sec (measured, median 31 ms/write, 20.8/sec) |
-| Connection-event hard ceiling (~20-30 ms interval) | ~33-50/sec — reaching the full 30-50 Hz band also needs firmware write-without-response on `0xFF01` (planned; `0xFF01` is write-with-response only today) |
+| Connection-event hard ceiling (~20-30 ms interval) | ~33-50/sec — reaching the full 30-50 Hz band uses firmware write-without-response on `0xFF01`, available on fw ≥ 4.16.3 (older firmware is write-with-response only) |
 
 **Recommended operating band: 30-50 Hz as a configurable target**, with
 coalescing on so the effective rate self-limits to your data rate (sources

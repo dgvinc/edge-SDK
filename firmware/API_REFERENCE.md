@@ -1,6 +1,6 @@
 # EDGE Glasses BLE API Reference
 
-**Firmware Version:** 4.16.2 (current) — per-feature minimum versions are noted inline (e.g. 4.15.9+ for smooth streamed smoothing, 4.16.1+ for battery)
+**Firmware Version:** 4.16.3 (current) — per-feature minimum versions are noted inline (e.g. 4.15.9+ for smooth streamed smoothing, 4.16.1+ for battery, 4.16.3+ for write-without-response on 0xFF01)
 **Last Updated:** August 2026
 
 This is the **wire / opcode reference** for the Narbis Edge glasses: every BLE command, its bytes, ranges, and on-device behavior. You can drive the glasses directly from raw BLE with only this document.
@@ -45,7 +45,7 @@ This is the **wire / opcode reference** for the Narbis Edge glasses: every BLE c
 | Supervision timeout | 32 s |
 | Idle Teardown | **2 minutes** with no client connected → full radio power-down; tap the magnet to re-arm advertising |
 | Simultaneous Clients | **1** — advertising stops on connect; a second central cannot discover or connect while another client holds the link |
-| Write Type | Write with response (`0xFF01` does **not** expose write-without-response) |
+| Write Type | Write with response; **fw ≥ 4.16.3 also accepts write-without-response on `0xFF01`** (feature-detect the property) for higher-rate streaming |
 
 **No NACKs:** the firmware never rejects a write. Out-of-range arguments are silently clamped or dropped — validate values client-side. To detect a failure, use a write timeout.
 
@@ -113,7 +113,7 @@ The core integration: map any protocol's feedback value to lens tint — a weara
 
 1. `[0xA4, minutes]` once — a session guard so auto-sleep doesn't end the session early ([Session & power](#session--power)).
 2. On each feedback update, map your value → duty 0-100 and write `[0xA5, duty]`.
-3. **Rate:** the firmware applies each `[0xA5, duty]` on its 10 ms tick (100 Hz internally, no throttling) — the **BLE link** is the only limit. The glasses request a 20–30 ms interval with slave latency 1 (~33–50 connection events/sec): a host on the default parameters sustains **~8–11 writes/sec**, and one that requests throughput-optimized connection parameters (e.g. WinRT `RequestPreferredConnectionParameters(ThroughputOptimized)`) reaches **~20 writes/sec** (both measured on fw 4.16.2). The full **30–50 Hz** band additionally needs firmware write-without-response on `0xFF01` (planned, not yet shipped). **Recommended: target 30–50 Hz with coalescing on** — the effective rate self-limits to your data rate. There is no 12 Hz or 20 Hz limit: the old "12 Hz" was the breathe pacer, and the "20 Hz ceiling" was a stale conservative figure. Decimate a faster signal — you don't need a write per sample.
+3. **Rate:** the firmware applies each `[0xA5, duty]` on its 10 ms tick (100 Hz internally, no throttling) — the **BLE link** is the only limit. The glasses request a 20–30 ms interval with slave latency 1 (~33–50 connection events/sec): a host on the default parameters sustains **~8–11 writes/sec**, and one that requests throughput-optimized connection parameters (e.g. WinRT `RequestPreferredConnectionParameters(ThroughputOptimized)`) reaches **~20 writes/sec** (both measured on fw 4.16.2). The full **30–50 Hz** band uses firmware write-without-response on `0xFF01`, available on **fw ≥ 4.16.3** (older firmware is write-with-response only). **Recommended: target 30–50 Hz with coalescing on** — the effective rate self-limits to your data rate. There is no 12 Hz or 20 Hz limit: the old "12 Hz" was the breathe pacer, and the "20 Hz ceiling" was a stale conservative figure. Decimate a faster signal — you don't need a write per sample.
 4. **Coalesce:** skip the write if `duty` is unchanged — the lens holds its state.
 5. **One write in flight:** never overlap writes (see [Connection](#connection)) — write-with-response paces throughput, so the configured rate is a *target*, never a queue.
 

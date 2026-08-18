@@ -2,7 +2,7 @@
 
 > **Audience.** Developers speaking the wire protocol directly — **Python** (via [bleak](https://github.com/hbldh/bleak)) or **JavaScript** (via Web Bluetooth) — whether you're using the edge-SDK libraries or bypassing them. Everything a client needs to talk to the **Narbis Edge** glasses and the **Narbis Earclip** over BLE is in this document.
 >
-> **Provenance.** Synced to glasses firmware **4.16.2+** and earclip firmware **config v4** — August 2026.
+> **Provenance.** Synced to glasses firmware **4.16.3+** and earclip firmware **config v4** — August 2026.
 >
 > **Scope.** Scanning, connecting, GATT discovery, command writes, notification parsing, driving the lens ([§4.6](#46-driving-the-edge-lens)), OTA firmware update, troubleshooting.
 >
@@ -57,7 +57,7 @@ async def main():
 
 asyncio.run(main())
 # Every write is ≥ 2 bytes (a 1-byte write is the legacy opacity command, §4.3);
-# 0xFF01 is write-with-response only, so pass response=True (§4.2).
+# response=True is universally safe; fw ≥ 4.16.3 also allows response=False (§4.6.1).
 ```
 
 JavaScript (Web Bluetooth — must run from a click handler, [§7.1](#71-web-bluetooth-gotchas)):
@@ -69,7 +69,7 @@ const svc  = await (await dev.gatt.connect()).getPrimaryService(0x00ff);
 const ctrl = await svc.getCharacteristic(0xff01);
 await ctrl.writeValueWithResponse(new Uint8Array([0xA4, 60]));   // 60-min session guard
 await ctrl.writeValueWithResponse(new Uint8Array([0xA5, 100]));  // 100 = fully dark
-// …[0xA5, 50] = half, [0xA5, 0] = clear. Every write is ≥ 2 bytes; 0xFF01 is write-with-response only.
+// …[0xA5, 50] = half, [0xA5, 0] = clear. Every write is ≥ 2 bytes; write-with-response is universally safe (fw ≥ 4.16.3 also allows write-without-response, §4.6.1).
 ```
 
 With the SDK it's a one-liner once connected — `glasses.set_opacity(1.0)` (or `set_static(100)`) for fully dark, `set_opacity(0.0)` for clear; see the [Python SDK API](../python-SDK/docs/API_REFERENCE.md).
@@ -103,7 +103,7 @@ async def run(get_signal):                    # get_signal() → 0.0..1.0
         while True:
             duty = round(get_signal() * 100)  # 0..1 → 0..100
             if duty != last:                  # coalesce: skip unchanged values
-                await client.write_gatt_char(CTRL, bytes([0xA5, duty]), response=True)  # 0xFF01 is write-with-response only
+                await client.write_gatt_char(CTRL, bytes([0xA5, duty]), response=True)  # safe on all fw; fw ≥ 4.16.3 also allows response=False
                 last = duty
             await asyncio.sleep(1 / 30)       # 30 Hz target; write-with-response self-throttles to link capacity
 ```
@@ -121,7 +121,7 @@ setInterval(async () => {
   const duty = Math.round(getSignal() * 100);                     // 0..1 → 0..100
   if (duty === last || busy) return;                              // coalesce; one write in flight
   busy = true; last = duty;
-  try { await ctrl.writeValueWithResponse(new Uint8Array([0xA5, duty])); }  // 0xFF01 is write-with-response only (§7.1)
+  try { await ctrl.writeValueWithResponse(new Uint8Array([0xA5, duty])); }  // safe on all fw; fw ≥ 4.16.3 also allows writeValueWithoutResponse (§7.1)
   catch { last = -1; }  // failed write: reset the coalesce key so the next frame retries (matches streamLensDuty)
   finally { busy = false; }
 }, 1000 / 30);   // 30 Hz target; the busy guard keeps one write in flight, self-throttling to link capacity
@@ -211,7 +211,7 @@ await client.start_notify(IBI_UUID, on_ibi)
 await client.write_gatt_char(EDGE_CTRL, bytes([0xA2, 80]), response=True)  # brightness 80%
 ```
 
-Use `response=True` for all control writes (ordering + back-pressure); `response=False` is reserved for the `0xFF02` OTA data chunks — the only characteristic that exposes write-without-response ([§6](#6-ota--shared-between-both-devices)).
+Use `response=True` for control writes (ordering + back-pressure); `response=False` (write-without-response) is available for the high-rate `0xA5` duty stream on **fw ≥ 4.16.3** (feature-detect the property), and always for `0xFF02` OTA data chunks. On fw < 4.16.3, `0xFF01` is write-with-response only ([§6](#6-ota--shared-between-both-devices)).
 
 ### 2.2 JavaScript (Web Bluetooth)
 
@@ -1226,7 +1226,7 @@ The primary third-party integration pattern: your software produces a feedback v
 - Three hardening rules (production-proven):
   1. **Coalesce** — skip the write if the duty is unchanged.
   2. **Never overlap writes** — if one is in flight, drop the frame (the next catches up). See the serialization rule in [§4.3](#43-control-characteristic-0xff01--command-opcodes).
-  3. **Keep exactly one write in flight** — `0xFF01` is **write-with-response only** on current firmware ([§4.2](#42-service-0x00ff--characteristic-map); only OTA `0xFF02` exposes write-no-response), and the with-response round-trip is exactly why the one-write-in-flight rule doubles as your rate limiter — it paces the stream to whatever the link sustains, so a high target rate is safe. If you add a property guard like the production dashboard's (`ch.properties?.writeWithoutResponse` → without-response, else with-response), write-without-response will be used automatically if a future firmware adds the property.
+  3. **Keep exactly one write in flight** — on **fw < 4.16.3** `0xFF01` is write-with-response only ([§4.2](#42-service-0x00ff--characteristic-map)), and the with-response round-trip doubles as your rate limiter (it paces the stream to whatever the link sustains, so a high target rate is safe). Add a property guard (`ch.properties?.writeWithoutResponse` → without-response, else with-response): on **fw ≥ 4.16.3** `0xFF01` exposes write-without-response, so a guarded client uses it automatically for higher throughput, and falls back to with-response on older firmware.
 - The 1-byte legacy opacity write (0–255, [§4.3](#43-control-characteristic-0xff01--command-opcodes)) is an equivalent alternative under the same cadence rules.
 - **Smoothing the stream — the recommended way to get smooth real-time feedback (fw ≥ 4.15.8 continuous / ≥ 4.15.9 full-resolution):** a live feedback value streamed at ~20–30 Hz is inherently **stepped** (each write is a discrete jump), and a noisy signal makes the lens visibly **jitter**. Write `[0xA0, τ]` **once** (persisted; send at connect) and the device applies an on-device EMA of time constant τ×10 ms so the lens **glides between your writes** — it bridges the inter-write gaps into continuous motion (no visible stepping) **and** absorbs per-sample noise without you filtering client-side. This is exactly what you want for real-time operant conditioning: smooth lens motion off a live, noisy signal without over-sending. Rule of thumb: **τ ≈ 1–2× your write period** (a 30 Hz stream → ~33 ms → arg 3–6; **arg 8 ≈ 80 ms** is a good general-purpose value). Optionally pair with `[0xA1, slew]` as a hard safety cap on how fast the lens may move ([§4.3](#43-control-characteristic-0xff01--command-opcodes)). `0xA0` / `0xA1` affect **commanded static only** (`0xA5` + the 1-byte opacity write), never strobe/breathe. Both are ignored by older firmware, so send them unconditionally; on fw ≥ 4.15.11 an accepted `0xA0`/`0xA1` write is echoed as a `0xF1` confirmation frame ([§4.3](#43-control-characteristic-0xff01--command-opcodes)).
 
@@ -1235,7 +1235,7 @@ The primary third-party integration pattern: your software produces a feedback v
 > The firmware is **never** the bottleneck: it applies each commanded static duty on its 10 ms tick (**100 Hz internally, no command throttling**). The **BLE link** is the limit, and it depends on the negotiated connection parameters:
 > - The glasses **request** a 20–30 ms interval with slave latency 1. A host that accepts those defaults sustains only **~8–11 writes/sec** (measured: real glasses, fw 4.16.2, Windows laptop).
 > - A host that **requests throughput-optimized / low-latency connection parameters** (e.g. WinRT `RequestPreferredConnectionParameters(ThroughputOptimized)`, held for the session) reaches **~20 writes/sec sustained** (measured: median 31 ms/write, 20.8/sec).
-> - The **hard ceiling** is the connection-event rate (~33–50/sec at a 20–30 ms interval). Reaching the full **30–50 Hz** band additionally needs firmware **write-without-response on `0xFF01`** — planned, not yet shipped (`0xFF01` is write-with-response only today).
+> - The **hard ceiling** is the connection-event rate (~33–50/sec at a 20–30 ms interval). Reaching the full **30–50 Hz** band uses firmware **write-without-response on `0xFF01`**, available on **fw ≥ 4.16.3** (older firmware is write-with-response only, which paces you to ~20/sec even with optimized connection params). On ≥ 4.16.3, feature-detect the `0xFF01` write-without-response property and stream duty writes without per-write acks.
 >
 > **Recommended: set 30–50 Hz as a configurable target with coalescing on**, so the effective rate self-limits to your data rate. Since feedback sources typically produce ≤ 16–30 new values/sec, coalesced writes rarely hit the ceiling anyway. Per-update latency is ~20–60 ms BLE transport + < 100 ms lens switch.
 >
@@ -1524,7 +1524,7 @@ sendCtrlCommand(chCtrl, 0xC1);                               // forget earclip p
 
 The firmware retains a complete on-board HRV-coherence pipeline: it collects IBIs (from the earclip relay on relay-enabled builds, or injected via `0xCA`), runs band-power analysis on a fixed FFT grid, produces the `0xF2` coherence packet ([§4.4.3](#443-coherence-packet-0xf2--18-b)), and can drive the lens itself through four **PPG programs**. Current apps do not use any of this — they compute their feedback app-side and drive the lens via [§4.6](#46-driving-the-edge-lens). The opcodes remain live on the wire and are documented here for completeness and for thin clients that want the glasses to do everything.
 
-**Minimal use** (per connect): `[0xCB, 0x01]` to declare the app the beat authority, `[0xB7, n]` to pick a program, then one 5-byte `[0xCA][ibi_ms:u16 LE][confidence][flags]` write per beat (write-with-response — `0xFF01` does not expose write-without-response, [§4.2](#42-service-0x00ff--characteristic-map); the firmware drops beats with `confidence < conf_threshold`, default 50, or `flags & 0x01` ARTIFACT). Coherence results arrive as `0xF2` frames at 1 Hz. `0xCB` is not persisted — re-assert on every connect.
+**Minimal use** (per connect): `[0xCB, 0x01]` to declare the app the beat authority, `[0xB7, n]` to pick a program, then one 5-byte `[0xCA][ibi_ms:u16 LE][confidence][flags]` write per beat (write-with-response is fine at a per-beat rate; the firmware drops beats with `confidence < conf_threshold`, default 50, or `flags & 0x01` ARTIFACT). Coherence results arrive as `0xF2` frames at 1 Hz. `0xCB` is not persisted — re-assert on every connect.
 
 **PPG programs** (`0xB7`, not persisted):
 
@@ -1964,7 +1964,7 @@ The wire protocol is identical across clients, but Web Bluetooth (Chrome / Edge 
 - **Foreground only.** A backgrounded/hidden tab throttles timers and can stop delivering notifications — there is no Web Bluetooth background mode. Expect drop-outs when the tab isn't visible and re-anchor any beat/sample clocks after a gap.
 - **Browser support.** Chrome / Edge / Brave on desktop + Android only. **No Firefox, no Safari, no iOS browser** (iOS has no Web Bluetooth).
 - **Permission caching + `device.forget()`.** The browser caches an accepted device (~30 s after disconnect) and re-matches it on the next `requestDevice()` without prompting. If a device's GATT cache goes stale (the "needs multiple Forget+Connect cycles" symptom), call `device.forget()` (Chrome 114+) to release the grant.
-- **`writeValueWithResponse` vs `writeValueWithoutResponse`.** On these devices, write-without-response exists **only on the `0xFF02` OTA data characteristic** — reserve `writeValueWithoutResponse` for OTA data chunks. Everything else — all `0xFF01` commands, the `0xA5` duty stream, per-beat `0xCA` on the legacy path, and the earclip's CONFIG_WRITE/MODE/PEER_ROLE — must use `writeValueWithResponse`: `0xFF01` does not advertise the write-without-response property, and Web Bluetooth rejects `writeValueWithoutResponse` with `NotSupportedError` when the property bit is absent.
+- **`writeValueWithResponse` vs `writeValueWithoutResponse`.** On **fw ≥ 4.16.3** the `0xFF01` control characteristic advertises write-without-response, so the high-rate `0xA5` duty stream may use `writeValueWithoutResponse` (feature-detect `char.properties.writeWithoutResponse`) for higher throughput. On older firmware — and always for the earclip's CONFIG_WRITE/MODE/PEER_ROLE — use `writeValueWithResponse`: when the property bit is absent, Web Bluetooth rejects `writeValueWithoutResponse` with `NotSupportedError`. The `0xFF02` OTA data characteristic has always exposed write-without-response.
 - **One write at a time.** A `writeValue*` call rejects if another GATT operation on the characteristic is still in flight — serialize commands **and** the duty stream through one promise queue (the serialization rule in [§4.3](#43-control-characteristic-0xff01--command-opcodes)).
 
 ```js
@@ -1982,7 +1982,7 @@ button.addEventListener('click', async () => {
 - **Windows may strip 16-bit service UUIDs from advertisements** entirely — always filter by device name, never by service UUID ([§2.2](#22-javascript-web-bluetooth)).
 - **Windows / WinRT scan cadence.** The WinRT backend surfaces advertisements in batches, and a freshly woken Edge (100–200 ms advertising interval) can take several seconds to appear. Scan with `timeout=10–15 s` and retry once before telling the user to tap the magnet — a 3-second scan will produce false "not found" results.
 - **Notify callbacks must not block.** bleak invokes your notification callback on the event loop (it accepts both sync and async callables). Never sleep or do heavy work inside it — push the payload onto an `asyncio.Queue` and process elsewhere. This is exactly the pattern the OTA loop in [§6.8](#68-python--complete-ota-loop-bleak) uses.
-- **`response=True` for control writes.** Always write the Edge control characteristic (`0xFF01`) and earclip CONFIG_WRITE/MODE/PEER_ROLE with `response=True`: you get ordering, back-pressure, and an exception when the earclip rejects a bad config. Reserve `response=False` for the `0xFF02` OTA data chunks **only** — the one characteristic that exposes write-without-response. `0xFF01` does not, so `response=False` there (including the `0xA5` duty stream and per-beat `0xCA`) raises NotSupported on BlueZ and is unreliable on WinRT.
+- **`response=True` for control writes.** Always write the Edge control characteristic (`0xFF01`) and earclip CONFIG_WRITE/MODE/PEER_ROLE with `response=True`: you get ordering, back-pressure, and an exception when the earclip rejects a bad config. `response=False` (write-without-response) works for the high-rate `0xA5` duty stream on **fw ≥ 4.16.3** (feature-detect the property) and always for `0xFF02` OTA data chunks. On fw < 4.16.3, `0xFF01` is write-with-response only, so `response=False` there raises NotSupported on BlueZ and is unreliable on WinRT.
 - **Reconnecting after the 2-minute teardown.** Once the Edge powers its radio down, `BleakClient.connect()` against a cached `BLEDevice` just times out. Catch the timeout/`BleakError`, prompt the user to tap the magnet, and go back to **scanning** — don't retry connect in a loop against the stale device object.
 - **Use full 128-bit UUID strings.** bleak wants `'0000ff01-0000-1000-8000-00805f9b34fb'`, not `0xFF01` — expand 16-bit UUIDs with the SIG base as in [§2.1](#21-python-bleak).
 - **One characteristic, one subscription.** The Edge's `0xFF03` multiplexes telemetry, relay frames, and OTA status; register a single dispatcher callback ([§4.4](#44-status-characteristic-0xff03--notification-multiplexer)) rather than starting/stopping notify around each operation.
@@ -2106,6 +2106,7 @@ OTA — Shared between Edge and Earclip (same UUIDs)
 | Glasses battery over BLE — `0x180F` / `0x2A19`, `0xFB` status frame, `0xC7` poll | 4.16.1 (V1.2+ hardware) | not exposed — no glasses battery over BLE |
 | Program-1 startup pulse silenced (only programs 2+ pulse on change) | 4.16.1 | program 1 also pulsed once on change |
 | `0xA5` clean static write — does not touch `brightness` / other programs | 4.16.2 | `0xA5` shared the `brightness` variable with `0xA2`; static dimming to 0 left other programs clear |
+| Write-without-response on `0xFF01` (higher-rate real-time streaming) | 4.16.3 | `0xFF01` is write-with-response only — control writes need an ATT round-trip (paces streaming to ~20/sec even with optimized connection params) |
 | `0xBA` breathe-sync | 4.15.5 | ignored (unknown opcode) |
 | `0xB0 0x01` breathe+strobe | 4.15.6 | plain breathe |
 | duty→opacity floor remap ([§4.6.4](#464-lens-opacity-is-not-linear--the-dutyopacity-floor-fw--4154)) | 4.15.4 | no floor remap |
