@@ -9,8 +9,10 @@ This example implements the Edge LSL conventions (see docs/INTEGRATION_GUIDE.md)
   the channel labeled 'Opacity' drives the lens as percent 0-100 float
   (unit 'normalized' = 0-1, rescaled). Newest stream wins if several match.
 - Emits status stream 'NarbisEdgeStatus' (type 'ListenerStatus', 3x float32,
-  ~1 Hz: Opacity / Battery=NaN / ClientConnected) whose metadata announces
-  what the bridge is listening for -- LSL has no sink discovery; this is it.
+  ~1 Hz: Opacity / Battery / ClientConnected) whose metadata announces what
+  the bridge is listening for -- LSL has no sink discovery; this is it.
+  Battery is read from the standard 0x180F Battery Service (firmware
+  >= 4.16.1 on V1.2+ hardware); NaN when unavailable.
 
 Requires:
     pip install edge-glasses pylsl
@@ -54,9 +56,12 @@ STATUS_STREAM_NAME = "NarbisEdgeStatus"
 STATUS_STREAM_TYPE = "ListenerStatus"    # announces the listener + its status
 STATUS_RATE_HZ = 1.0
 
-# Lens write policy: control samples are decimated to <= 12 Hz and unchanged
-# values are coalesced (no redundant BLE writes).
-MAX_LENS_WRITE_HZ = 12
+# Lens write policy: control samples are decimated to the bridge loop rate and
+# unchanged values are coalesced (no redundant BLE writes). There is no 20 Hz
+# protocol ceiling (that was a stale doc figure) -- 30-50 Hz is the real-time
+# target; coalescing + one write in flight keep the effective rate at the data
+# rate.
+MAX_LENS_WRITE_HZ = 30
 
 
 def pick_newest_stream(streams):
@@ -102,6 +107,7 @@ class GlassesLSLBridge:
         self.control_channel = 0
         self.input_range = CONTROL_RANGE      # resolved when the inlet connects
         self.current_opacity = 0.0            # last commanded duty, percent
+        self.battery_pct = math.nan           # last battery read (0x180F), NaN if unavailable
 
     async def connect_glasses(self):
         """Connect to EDGE Glasses"""
@@ -136,7 +142,7 @@ class GlassesLSLBridge:
         channels = desc.append_child("channels")
         for label, unit in (
             ("Opacity", "percent"),          # last commanded lens duty
-            ("Battery", "percent"),          # NaN: no battery readout over BLE
+            ("Battery", "percent"),          # 0x180F service (fw >= 4.16.1); NaN if unavailable
             ("ClientConnected", "binary"),   # 1.0 while BLE link is live
         ):
             ch = channels.append_child("channel")
@@ -290,15 +296,15 @@ class GlassesLSLBridge:
         """
         Push one status sample: [Opacity, Battery, ClientConnected]
 
-        Battery is always NaN on current hardware -- the Edge exposes no
-        battery readout over BLE. NaN = unavailable; the channel is kept
-        for spec stability.
+        Battery is the last value read from the standard 0x180F Battery
+        Service (firmware >= 4.16.1 on V1.2+ hardware); NaN means the service
+        is absent or the level is unknown on this unit. NaN = unavailable.
         """
         if not self.outlet:
             return
         connected = 1.0 if (self.glasses is not None
                             and self.glasses.is_connected) else 0.0
-        self.outlet.push_sample([self.current_opacity, math.nan, connected])
+        self.outlet.push_sample([self.current_opacity, self.battery_pct, connected])
 
     async def run_bridge(self, duration: float = 60.0):
         """
@@ -321,6 +327,7 @@ class GlassesLSLBridge:
         self.running = True
         start_time = time.time()
         last_status = 0.0
+        last_battery = 0.0
         last_written: Optional[int] = None
 
         try:
@@ -335,14 +342,23 @@ class GlassesLSLBridge:
                         self.current_opacity = float(target)
                         print(f"  Control: {duty:.1f}% -> set_static({target})")
 
-                # Status heartbeat at ~1 Hz
                 now = time.time()
+
+                # Refresh battery every ~30 s (standard 0x180F service,
+                # fw >= 4.16.1; returns None -> NaN on units without it)
+                if now - last_battery >= 30.0:
+                    level = await self.glasses.get_battery()
+                    self.battery_pct = float(level) if level is not None else math.nan
+                    last_battery = now
+
+                # Status heartbeat at ~1 Hz
                 if now - last_status >= 1.0 / STATUS_RATE_HZ:
                     self.publish_status()
                     last_status = now
 
-                # 10 Hz loop -- keeps lens writes under the <= 12 Hz cap
-                await asyncio.sleep(0.1)
+                # Real-time loop at the lens write target (no 20 Hz ceiling);
+                # coalescing means most ticks send nothing.
+                await asyncio.sleep(1.0 / MAX_LENS_WRITE_HZ)
 
         finally:
             self.running = False
@@ -448,7 +464,7 @@ class LSLNeurofeedback:
                     if int(elapsed) % 5 == 0:  # Every 5 seconds
                         print(f"  Alpha: {smoothed:.3f} -> Opacity: {opacity}")
 
-                await asyncio.sleep(0.05)  # 20 Hz — max recommended rate for streaming set_opacity
+                await asyncio.sleep(0.033)  # ~30 Hz real-time neurofeedback (no 20 Hz ceiling)
 
         finally:
             self.running = False

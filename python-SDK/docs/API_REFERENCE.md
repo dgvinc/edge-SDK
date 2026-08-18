@@ -1,7 +1,7 @@
 # EDGE Glasses Python SDK — API Reference
 
-**Firmware 4.15.6+ (lens-config methods need 4.15.7+) — July 2026**
-**SDK version:** 2.2.0
+**Firmware 4.15.6+ (lens-config methods need 4.15.7+; battery needs 4.16.1+) — current firmware 4.16.2, August 2026**
+**SDK version:** 2.3.0
 
 This document maps every Python SDK method to the exact bytes it writes over BLE.
 For the full protocol (OTA, status/notify, PPG stream), see the
@@ -41,7 +41,7 @@ sends a single byte.
 
 | Method | Wire bytes | Notes |
 |--------|-----------|-------|
-| `set_opacity(value)` | `[value]` (1 byte, 0-255) | 0-255 → 0-100% static duty; stops current mode; not persisted. Streamable at ~12 Hz (recommended, production-proven); ~20 Hz is only a tolerated ceiling. |
+| `set_opacity(value)` | `[value]` (1 byte, 0-255) | 0-255 → 0-100% static duty; stops current mode; not persisted. Stream for real-time feedback — no 20 Hz ceiling (a stale doc figure); target 30-50 Hz with coalescing. See [Real-time lens control](#real-time-lens-control-feedback--operant-conditioning). |
 | `clear()` | `[0x00]` | Fully transparent |
 | `dark()` | `[0xFF]` | Fully opaque |
 
@@ -62,6 +62,83 @@ sends a single byte.
 | `set_lens_smoothing(ms)` | `[0xA0, ms // 10]` | 0-2550 ms (10 ms resolution); 0 = off — EMA glide between commanded static targets | yes |
 | `set_lens_max_rate(percent_per_100ms)` | `[0xA1, rate]` | 0-100 %/100ms; 0 = unlimited — hard slew cap after the smoothing glide | yes |
 | `set_disconnect_behavior(fail_clear)` | `[0xA3, 0x01/0x00]` | True = go clear on link loss, False = freeze at last output (default) | yes |
+
+---
+
+## Real-time lens control (feedback / operant conditioning)
+
+Real-time lens dimming is the primary use case. The key facts:
+
+### Update rate
+
+There is **no 20 Hz protocol ceiling** — that figure was a stale conservative
+doc value with no basis in the protocol. The firmware applies each commanded
+duty on its 10 ms internal tick (100 Hz, no throttling); the **BLE link** is
+the limit, and it depends on the negotiated connection parameters:
+
+| Connection parameters | Sustained throughput |
+|-----------------------|----------------------|
+| Host accepts the glasses' defaults (20-30 ms interval, slave latency 1) | ~8-11 writes/sec (measured, fw 4.16.2) |
+| Host requests throughput-optimized / low-latency params, held for the session | ~20 writes/sec (measured, median 31 ms/write, 20.8/sec) |
+| Connection-event hard ceiling (~20-30 ms interval) | ~33-50/sec — reaching the full 30-50 Hz band also needs firmware write-without-response on `0xFF01` (planned; `0xFF01` is write-with-response only today) |
+
+**Recommended operating band: 30-50 Hz as a configurable target**, with
+coalescing on so the effective rate self-limits to your data rate (sources
+typically produce ≤ 16-30 new values/sec, so coalesced writes rarely hit the
+ceiling). Always **coalesce** (skip unchanged duty) and keep **exactly one
+write in flight** — write-with-response paces throughput for you, so the
+configured rate is a target, never a queue. Per-update latency: ~20-60 ms BLE
+transport + <100 ms lens switch. `FeedbackStream` implements all of this
+(default 30 Hz, cap 45 Hz).
+
+> **Why not 12 / 20 Hz?** `12 Hz` was only the on-board breathe *pacer* cadence
+> (the reference app's paced-breathing update rate); the `20 Hz` "ceiling" was
+> a stale conservative figure. The real story is the table above.
+
+### Clean static writes (firmware ≥ 4.16.2)
+
+`set_static()` (`0xA5`) is a clean static-duty write that does **not** touch
+`set_brightness()` (`0xA2`), the persistent max-tint / breathe depth. So you can
+stream real-time dimming to 0 without zeroing the depth of the breathe / strobe
+programs. On firmware ≤ 4.16.1 the two shared one variable (a `set_static()` to
+0 left brightness at 0, so other programs rendered clear until `0xA2` was
+re-sent); 4.16.2 decouples them and self-heals a persisted brightness of 0 at
+boot.
+
+### Smoothing to eliminate inter-write jitter (`0xA0`)
+
+A live feedback stream is stepped (each write is a discrete jump) and a noisy
+signal makes the lens visibly jitter. Set on-device EMA smoothing with
+`set_lens_smoothing(ms)` **once at connect** so the lens **glides between your
+writes** — continuous motion, no visible stepping, and it absorbs per-sample
+noise without client-side filtering. Tune τ ≈ 1-2× your write period (30 Hz →
+~33 ms → ~35-70 ms; ~80 ms is a good general value). Requires fw ≥ 4.15.8 for
+continuous streams, ≥ 4.15.9 for full-resolution (10-bit PWM) smoothness. This
+is the **recommended** way to get smooth real-time feedback without
+over-sending. Optionally pair with `set_lens_max_rate()` (`0xA1`) as a hard
+safety cap. `0xA0`/`0xA1` affect commanded static duty only, not strobe/breathe.
+
+### Tint X → Y over Z seconds (timed fade)
+
+Two ways:
+
+1. **Firmware slew ramp — one write, on-device (recommended for a fixed fade).**
+   Set the slew cap with `set_lens_max_rate()` (`0xA1`) so the firmware ramps at
+   a constant rate, then write the target once with `set_static()` (`0xA5`).
+   To move `Δduty` percent over `Z` seconds:
+   `slew (%/100ms) = round(Δduty / (Z × 10))` (clamp 1-100; 0 = unlimited/instant).
+   Example — fade fully clear→dark (Δ=100) over 2 s: `slew = 100/(2×10) = 5`:
+   ```python
+   await glasses.set_lens_max_rate(5)   # [0xA1, 5]
+   await glasses.set_static(100)        # [0xA5, 100] -> lens ramps ~2 s on-device
+   await glasses.set_lens_max_rate(0)   # [0xA1, 0] -> later writes snap again
+   ```
+   The slew is a fixed rate, so for an exact duration regardless of distance,
+   recompute `slew` from the actual Δ each time. fw ≥ 4.15.7.
+2. **Client-side interpolation (full curve control, any firmware).** Step
+   `set_static()` from X to Y over Z seconds at your write rate:
+   `steps = Z × rate`; `duty_i = round(X + (Y − X)·i/steps)`; write each at
+   `1/rate` spacing (coalesced). Lets you do linear, ease-in/out, etc.
 
 ### Modes
 
@@ -88,6 +165,25 @@ sends a single byte.
 | `sleep()` | `[0xA7, 0x00]` | Deep sleep now; arg ignored (padded) |
 | `factory_reset()` | `[0xBF, 0x00]` | Reset NVS settings; arg ignored (padded) |
 | `send_command(opcode, payload=None)` | `[opcode, ...payload]` padded to ≥ 2 B | Low-level escape hatch |
+
+### Battery (firmware ≥ 4.16.1, V1.2+ hardware)
+
+| Method | Reads | Returns |
+|--------|-------|---------|
+| `get_battery()` | Battery Level `0x2A19` (GATT read) on the standard Battery Service `0x180F` | `int` 0-100, or `None` if the `0x180F` service is absent (pre-4.16.1 firmware, or a board built without the battery divider) |
+
+`get_battery()` reads the standard BLE Battery Service — a GATT read on `0x180F`
+/ `0x2A19`, not an opcode on the control characteristic. On fw ≥ 4.16.1 the
+`0x2A19` characteristic is registered on every unit but **reads 0 while the
+level is unknown** — it cannot distinguish "unknown" from a genuine 0%. For
+millivolts + a charging flag + a real unknown flag, read the `0xFB` status frame
+on `0xFF03`: `[mv:u16 LE][soc:u8][charging:u8]`, where `soc = 0xFF` means
+unknown/unsupported. Opcode `0xC7` polls the battery / dumps probe diagnostics
+(`[0xC7, 0x00]` refresh, `[0xC7, 0x01]` reprobe the ADC channel). A board without
+the divider reports unsupported there (mv=0, soc=0xFF, charging=0xFF) — treat a
+missing `0x180F` service or a persistent 0 as "battery not available on this
+unit." See the [protocol doc](../../docs/bluetooth-protocol.md) for the full
+surface.
 
 ### Preset Sessions (fixed-parameter)
 
@@ -141,6 +237,7 @@ configure the renderer and set the auto-sleep duration.
 | `0xB5` | Breathe waveform | 0 sine / 1 linear | yes | `start_breathe(waveform=...)` |
 | `0xBA` | Breathe sync | `[cycle_ms:u16 LE][inhale_pct:u8]` | no | `sync_breath` |
 | `0xBF` | Factory reset | arg ignored (send 0) | — | `factory_reset` |
+| `0xC7` | Battery poll / probe diagnostics | `0x00` refresh / `0x01` reprobe ADC; fw ≥ 4.16.1 | — | not an SDK method — use `get_battery()` (0x180F) / see [protocol doc](../../docs/bluetooth-protocol.md) |
 | `0xA8`/`0xA9`/`0xAA`/`0xAD` | OTA | — | — | not an SDK method — see [protocol doc](../../docs/bluetooth-protocol.md) |
 
 ---

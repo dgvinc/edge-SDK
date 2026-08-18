@@ -228,8 +228,9 @@ class MuseMeditationTrainer:
                     self.processor.process_sample(sample)
 
                 # Update glasses based on meditation score
-                # (EEG is pulled fast, but lens writes are capped at <= 20 Hz)
-                if time.time() - last_write >= 0.05:
+                # (EEG is pulled fast; pace lens writes to ~30 Hz for smooth
+                # real-time neurofeedback -- there is no 20 Hz ceiling)
+                if time.time() - last_write >= 0.033:
                     opacity = int(self.meditation_score * 255)
                     await self.glasses.set_opacity(opacity)
                     last_write = time.time()
@@ -323,8 +324,9 @@ class MuseFocusTrainer:
                     self.processor.process_sample(sample)
 
                 # Higher focus = clearer glasses (inverted from meditation)
-                # (EEG is pulled fast, but lens writes are capped at <= 20 Hz)
-                if time.time() - last_write >= 0.05:
+                # (EEG is pulled fast; pace lens writes to ~30 Hz for smooth
+                # real-time neurofeedback -- there is no 20 Hz ceiling)
+                if time.time() - last_write >= 0.033:
                     opacity = int((1 - self.focus_score) * 255)
                     await self.glasses.set_opacity(opacity)
                     last_write = time.time()

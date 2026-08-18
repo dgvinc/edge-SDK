@@ -19,7 +19,30 @@ npm install edge-glasses
 
 ## Quick Start
 
-**Real-time opacity streaming — a drop-in screen-dimmer replacement.** Hold one connection open and push your feedback value into a `FeedbackStream`: `feed(duty)` takes the same 0 (clear) → 100 (fully dark) your on-screen dimmer already produces, `feedReward(v)` takes a 0..1 reward value. Call them from any callback at any rate — the stream's internal writer handles the ~12 Hz decimation, unchanged-value coalescing, and write serialization for you.
+**Connect and set opacity — the simplest thing that works.** `setStatic(duty)` sets the lens **0 (clear) → 100 (fully dark)**:
+
+```typescript
+import { Glasses } from 'edge-glasses';
+
+const glasses = new Glasses();
+await glasses.connect();       // must be called from a user gesture (button click)
+await glasses.setStatic(0);    // 0   = clear
+await glasses.setStatic(100);  // 100 = fully dark
+await glasses.setStatic(50);   // 50  = half
+```
+
+Prefer raw Web Bluetooth? The lens control lives on service `0x00ff`, characteristic `0xff01`, written **with response** (writes must be ≥ 2 bytes — a 1-byte write is the legacy opacity command):
+
+```typescript
+const dev = await navigator.bluetooth.requestDevice({
+  filters: [{ name: 'Narbis_Edge' }], optionalServices: [0x00ff],
+});
+const server = await dev.gatt.connect();
+const ch = await (await server.getPrimaryService(0x00ff)).getCharacteristic(0xff01);
+await ch.writeValueWithResponse(new Uint8Array([0xA5, 50]));  // 0 clear .. 100 dark
+```
+
+**Real-time opacity streaming — a drop-in screen-dimmer replacement.** Hold one connection open and push your feedback value into a `FeedbackStream`: `feed(duty)` takes the same 0 (clear) → 100 (fully dark) your on-screen dimmer already produces, `feedReward(v)` takes a 0..1 reward value. Call them from any callback at any rate — the stream's internal writer handles the ~30 Hz decimation, unchanged-value coalescing, and write serialization for you.
 
 ```typescript
 import { Glasses } from 'edge-glasses';
@@ -32,7 +55,7 @@ const glasses = new Glasses();
 document.getElementById('connect')?.addEventListener('click', async () => {
   await glasses.connect();
   await glasses.setDuration(60);                 // session guard: no auto-sleep for 60 min
-  const stream = glasses.startFeedbackStream();  // 12 Hz writer -- coalesces + serializes for you
+  const stream = glasses.startFeedbackStream();  // 30 Hz writer -- coalesces + serializes for you
   onFeedback((v) => stream.feedReward(v));       // push your 0..1 feedback value, any callback, any rate
   // or stream.feed(duty) with your dimmer's existing 0-100% value
 });
@@ -92,7 +115,7 @@ import { Glasses } from 'edge-glasses';
 const glasses = new Glasses();
 await glasses.connect();
 
-// Simple opacity control (legacy 1-byte write; stream at ~12 Hz recommended, <= 20 Hz tolerated)
+// Simple opacity control (legacy 1-byte write; stream via FeedbackStream at 30 Hz by default)
 await glasses.clear();           // Fully transparent
 await glasses.setOpacity(128);   // 50% dark
 await glasses.dark();            // Fully opaque
@@ -173,7 +196,7 @@ await glasses.startBreathe({ bpm: 5 });
 
 ### Real-time Biofeedback
 
-Map a continuous signal to lens opacity at ~12 Hz (production-proven rate; ~20 Hz is the tolerated ceiling):
+Map a continuous signal to lens opacity. There is **no 12 Hz or 20 Hz limit** — the old "12 Hz" was the on-board breathe pacer and the "20 Hz ceiling" was a stale figure; the real limit is the BLE link. On the default connection parameters a host sustains ~8–11 writes/sec, and one that requests throughput-optimized parameters reaches ~20 writes/sec; `startFeedbackStream()` targets 30 Hz and coalesces, so the effective rate self-limits to your data rate. Prefer the stream (it serializes writes for you), but a hand loop works too:
 
 ```typescript
 // Update opacity in real-time (e.g., from sensor data)
@@ -183,11 +206,31 @@ function updateFromSensor(value: number) {
   glasses.setOpacity(opacity);
 }
 
-// Example: 12 Hz update loop
+// Example: ~30 Hz update loop
 setInterval(() => {
   const sensorValue = getSensorReading();  // Your function
   updateFromSensor(sensorValue);
-}, 50);
+}, 33);
+```
+
+**Smooth streaming.** A raw stream is stepped (each write is a discrete jump) and a
+noisy signal makes the lens jitter. Enable on-device EMA smoothing once at connect and
+the lens **glides between your writes** and absorbs per-sample noise — the recommended
+way to get smooth feedback without over-sending. Tune τ ≈ 1–2× your write period (30 Hz
+→ ~33 ms → `setLensSmoothing(80)` is a good general value):
+
+```typescript
+await glasses.setLensSmoothing(80);   // ~80 ms EMA glide (fw 4.15.8+ streaming, 4.15.9+ full-res)
+```
+
+**Timed tint ramp (X → Y over Z s).** For a fixed on-device fade, set the slew cap then
+write the target once: `rate = round(Δduty / (Z × 10))` %/100ms. Fade clear → dark over
+2 s (Δ = 100 → rate 5):
+
+```typescript
+await glasses.setLensMaxRate(5);      // 5 %/100ms
+await glasses.setStatic(100);         // ramps over ~2 s on-device
+await glasses.setLensMaxRate(0);      // afterward: writes snap again
 ```
 
 For breathing entrainment, do **not** stream per-tick opacity to draw a waveform —
@@ -259,18 +302,19 @@ function GlassesControl() {
 
 | Method | Description |
 |--------|-------------|
-| `setOpacity(0-255)` | Static lens opacity (legacy 1-byte write; stream at ~12 Hz, ≤ 20 Hz ceiling) |
+| `setOpacity(0-255)` | Static lens opacity (legacy 1-byte write; stream via `startFeedbackStream`) |
 | `clear()` | Fully transparent |
 | `dark()` | Fully opaque |
-| `setStatic(0-100)` | Static mode at duty cycle % |
-| `startFeedbackStream(rateHz=12)` | Plug-and-play real-time stream: returns a `FeedbackStream` — `feed(duty)` / `feedReward(0..1)` for proportional dimming; `rewardEvent(duty, holdMs)` for immediate discrete operant rewards (bypasses the tick); internal writer coalesces + serializes; `stop()` clears the lens |
+| `setStatic(0-100)` | Static mode at duty cycle % (fw ≥ 4.16.2: clean static — no longer touches `setBrightness`) |
+| `startFeedbackStream(rateHz=30)` | Plug-and-play real-time stream: returns a `FeedbackStream` — `feed(duty)` / `feedReward(0..1)` for proportional dimming; `rewardEvent(duty, holdMs)` for immediate discrete operant rewards (bypasses the tick); internal writer coalesces + serializes; `stop()` clears the lens. Default 30 Hz, capped at 45 Hz |
+| `getBattery()` | Battery level 0-100, or `null` if unavailable (fw ≥ 4.16.1 + V1.2 hardware; reads `0x2A19`). A returned `0` may mean *unknown* on some builds — the `0xFB` status frame carries a true unknown/charging flag |
 | `sleep()` | Enter deep sleep |
 
 ### Settings (persisted on device)
 
 | Method | Description |
 |--------|-------------|
-| `setBrightness(0-100)` | Lens level / breathe depth % (persisted; same firmware variable `setStatic` writes — not a ceiling) |
+| `setBrightness(0-100)` | Lens level / breathe depth % (persisted; the max-tint that scales breathe & strobe — on fw ≥ 4.16.2 `setStatic` no longer writes it, on fw ≤ 4.16.1 they shared one variable) |
 | `setDuration(1-60)` | Session length in minutes (auto-sleep at end) |
 | `setStrobeFrequency(1-50)` | Strobe frequency in Hz |
 | `setStrobeDuty(10-90)` | Strobe dark-phase duty % |

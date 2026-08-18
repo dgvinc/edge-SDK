@@ -2,7 +2,7 @@
 
 Control EDGE Smart LCD Glasses (`Narbis_Edge`) over Bluetooth Low Energy.
 
-**v2.0.0** — targets glasses firmware 4.15.6+. This is a breaking release; see the
+**v2.3.0** — targets glasses firmware 4.15.6+ (lens-config needs 4.15.7+; battery needs 4.16.1+). See the
 [migration table](#migrating-from-v1) below.
 
 The glasses are a **display**: all coherence / HRV / biofeedback processing runs in your
@@ -17,7 +17,40 @@ pip install edge-glasses
 
 ## Quick Start
 
-**Real-time opacity streaming — a drop-in screen-dimmer replacement.** Hold one connection open and push your feedback value into a `FeedbackStream`: `feed(duty)` takes the same 0 (clear) → 100 (fully dark) your on-screen dimmer already produces, `feed_reward(v)` takes a 0..1 reward value. Call them from any callback at any rate — the stream's internal writer handles the ~12 Hz decimation, unchanged-value coalescing, and write serialization for you.
+**Connect and set opacity — the simplest thing that works.** `set_static(duty)` sets the lens **0 (clear) → 100 (fully dark)**:
+
+```python
+import asyncio
+from edge_glasses import Glasses
+
+async def main():
+    async with Glasses() as glasses:      # scans for 'Narbis_Edge' and connects
+        await glasses.set_duration(60)    # session guard: no auto-sleep for 60 min
+        await glasses.set_static(0)       # 0   = clear
+        await glasses.set_static(100)     # 100 = fully dark
+        await glasses.set_static(50)      # 50  = half
+
+asyncio.run(main())
+```
+
+Prefer raw BLE? Every command is a ≥ 2-byte **write-with-response** on characteristic `0xFF01` (a 1-byte write is the legacy opacity command):
+
+```python
+import asyncio
+from bleak import BleakClient, BleakScanner
+
+CTRL = "0000ff01-0000-1000-8000-00805f9b34fb"  # control characteristic 0xFF01
+
+async def main():
+    dev = await BleakScanner.find_device_by_name("Narbis_Edge")
+    async with BleakClient(dev) as c:
+        await c.write_gatt_char(CTRL, bytes([0xA4, 60]), response=True)  # session guard
+        await c.write_gatt_char(CTRL, bytes([0xA5, 50]), response=True)  # 0 clear .. 100 dark
+
+asyncio.run(main())
+```
+
+**Real-time opacity streaming — a drop-in screen-dimmer replacement.** Hold one connection open and push your feedback value into a `FeedbackStream`: `feed(duty)` takes the same 0 (clear) → 100 (fully dark) your on-screen dimmer already produces, `feed_reward(v)` takes a 0..1 reward value. Call them from any callback at any rate — the stream's internal writer handles the ~30 Hz decimation, unchanged-value coalescing, and write serialization for you.
 
 ```python
 import asyncio
@@ -28,7 +61,7 @@ async def main():
     # value to lens tint -- dim when out of condition, clear when in.
     async with Glasses() as glasses:
         await glasses.set_duration(60)                 # session guard: no auto-sleep for 60 min
-        stream = glasses.start_feedback_stream()       # 12 Hz writer -- coalesces + serializes for you
+        stream = glasses.start_feedback_stream()       # 30 Hz writer -- coalesces + serializes for you
         your_pipeline.on_update(stream.feed_reward)    # push your 0..1 feedback value, any callback, any rate
         # or stream.feed(duty) with your dimmer's existing 0-100% value
         await asyncio.Event().wait()                   # run until you end the session
@@ -41,11 +74,12 @@ asyncio.run(main())
 
 ## Features
 
-- Simple opacity control (0-255, streamable — ~12 Hz recommended, ~20 Hz ceiling)
+- Simple opacity control (0-255, streamable — target 30–50 Hz, coalesced; no 12/20 Hz limit)
 - On-board breathe engine (rate, inhale ratio, holds, waveform, optional strobe modulation)
 - Breath phase-lock (`sync_breath`) for app-paced, fractional-rate breathing
 - Strobe mode (1-50 Hz, 10-90% duty)
 - Lens-config knobs (fw 4.15.7+): on-device smoothing so streamed feedback glides, a transition-rate safety cap, and go-clear-on-disconnect
+- Glasses battery read over BLE (fw 4.16.1+ on V1.2 hardware): standard Battery Service via `get_battery()`
 - Fixed-parameter preset sessions (relax, focus, meditate, sleep)
 - Async/await API using `bleak` BLE library
 - Cross-platform (Windows, macOS, Linux, Raspberry Pi)
@@ -196,7 +230,11 @@ async def find_devices():
 
 ### Real-time Control (Research/Neurofeedback)
 
-Map a continuous signal to opacity at ~12 Hz (production-proven rate; ~20 Hz is the tolerated ceiling):
+Map a continuous signal to opacity. There is **no 12 Hz or 20 Hz limit** — the old "12 Hz"
+was the on-board breathe pacer and the "20 Hz ceiling" was a stale conservative figure; the
+real limit is the BLE link (a host on default connection parameters sustains ~8–11 writes/sec,
+one requesting throughput-optimized parameters ~20 writes/sec). Prefer `start_feedback_stream()`
+(default 30 Hz, coalesced, writes serialized for you), but a hand loop works too:
 
 ```python
 async def neurofeedback_loop():
@@ -210,7 +248,26 @@ async def neurofeedback_loop():
             opacity = int(alpha_power * 255)
             await glasses.set_opacity(opacity)
 
-            await asyncio.sleep(1/12)  # ~12 Hz update rate (≤20 Hz tolerated)
+            await asyncio.sleep(1/30)  # ~30 Hz update rate
+```
+
+**Smoothing.** A raw stream is stepped and a noisy signal makes the lens jitter. Enable
+on-device EMA smoothing once at connect and the lens **glides between your writes** and
+absorbs per-sample noise — the recommended way to get smooth feedback without over-sending.
+Tune τ ≈ 1–2× your write period (30 Hz → ~33 ms → `set_lens_smoothing(80)` is a good general value):
+
+```python
+await glasses.set_lens_smoothing(80)   # ~80 ms EMA glide (fw 4.15.8+ streaming, 4.15.9+ full-res)
+```
+
+**Timed tint ramp (X → Y over Z s).** For a fixed on-device fade, set the slew cap then write
+the target once: `rate = round(Δduty / (Z × 10))` %/100ms. Fade clear → dark over 2 s
+(Δ = 100 → rate 5):
+
+```python
+await glasses.set_lens_max_rate(5)     # 5 %/100ms
+await glasses.set_static(100)          # ramps over ~2 s on-device
+await glasses.set_lens_max_rate(0)     # afterward: writes snap again
 ```
 
 For breathing entrainment, do **not** stream opacity to draw a waveform — use the
@@ -236,9 +293,10 @@ Full method → wire-byte mapping in [docs/API_REFERENCE.md](docs/API_REFERENCE.
 | `await glasses.set_opacity(0-255)` | Set lens opacity (legacy 1-byte write) |
 | `await glasses.clear()` | Fully transparent |
 | `await glasses.dark()` | Fully opaque |
-| `await glasses.set_static(0-100)` | Static mode at duty % |
-| `glasses.start_feedback_stream(rate_hz=12)` | Plug-and-play real-time stream: returns a `FeedbackStream` — `feed(duty)` / `feed_reward(0..1)` for proportional dimming; `await reward_event(duty, hold_ms)` for immediate discrete operant rewards (bypasses the tick); internal writer coalesces + serializes; `await stream.stop()` clears the lens |
-| `await glasses.set_brightness(0-100)` | Lens level / breathe depth (persisted; same firmware variable `set_static` writes — not a ceiling) |
+| `await glasses.set_static(0-100)` | Static mode at duty % (fw ≥ 4.16.2: clean static — no longer touches `set_brightness`) |
+| `glasses.start_feedback_stream(rate_hz=30)` | Plug-and-play real-time stream: returns a `FeedbackStream` — `feed(duty)` / `feed_reward(0..1)` for proportional dimming; `await reward_event(duty, hold_ms)` for immediate discrete operant rewards (bypasses the tick); internal writer coalesces + serializes; `await stream.stop()` clears the lens. Default 30 Hz, capped at 45 Hz |
+| `await glasses.get_battery()` | Battery level 0-100, or `None` if unavailable (fw ≥ 4.16.1 + V1.2 hardware; reads `0x2A19`). A returned `0` may mean *unknown* on some builds — the `0xFB` status frame carries a true unknown/charging flag |
+| `await glasses.set_brightness(0-100)` | Lens level / breathe depth (persisted; the max-tint that scales breathe & strobe — on fw ≥ 4.16.2 `set_static` no longer writes it, on fw ≤ 4.16.1 they shared one variable) |
 | `await glasses.set_lens_smoothing(ms)` | On-device glide between streamed targets, EMA τ 0-2550 ms, 0 = off (persisted; fw 4.15.7+) |
 | `await glasses.set_lens_max_rate(pct)` | Hard cap on lens transition speed, %/100ms, 0 = unlimited (persisted; fw 4.15.7+) |
 | `await glasses.set_disconnect_behavior(fail_clear)` | True = lens goes clear on link loss instead of freezing (persisted; fw 4.15.7+) |

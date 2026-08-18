@@ -32,7 +32,7 @@ EDGE glasses feature LCD lenses that dynamically change opacity via Bluetooth. A
 ### Why EDGE?
 
 - **Open Protocol** — Simple BLE API, no vendor lock-in
-- **Low Latency** — ~20–60 ms write-to-lens transport; ~12 Hz production update rate for real-time feedback
+- **Low Latency** — ~20–60 ms write-to-lens transport; streams real-time feedback at a configurable 30–50 Hz target
 - **Cross-Platform SDKs** — Python for research, JS for web apps
 - **Sensor Agnostic** — Works with any biosignal source via LSL/brainflow
 - **Research Ready** — Compatible with OpenBCI, Muse, Polar, and lab equipment
@@ -60,19 +60,58 @@ EDGE glasses feature LCD lenses that dynamically change opacity via Bluetooth. A
 
 The glasses advertise as **`Narbis_Edge`**. If they don't show up in a scan, tap the magnet on the temple — the radio powers down after 2 minutes with no client connected.
 
+**Connect and set opacity — the minimal loop.** One connection, one command: `[0xA5, duty]` sets the lens **0 (clear) → 100 (fully dark)**. Writes must be **≥ 2 bytes** (a 1-byte write is the legacy opacity command) and **write-with-response** on characteristic `0xFF01`.
+
+```python
+# Python, raw BLE via bleak
+import asyncio
+from bleak import BleakClient, BleakScanner
+
+CTRL = "0000ff01-0000-1000-8000-00805f9b34fb"   # control characteristic 0xFF01
+
+async def main():
+    dev = await BleakScanner.find_device_by_name("Narbis_Edge")
+    async with BleakClient(dev) as c:
+        await c.write_gatt_char(CTRL, bytes([0xA4, 60]),  response=True)   # session guard: 60 min
+        await c.write_gatt_char(CTRL, bytes([0xA5, 0]),   response=True)   # 0   = clear
+        await c.write_gatt_char(CTRL, bytes([0xA5, 100]), response=True)   # 100 = fully dark
+        await c.write_gatt_char(CTRL, bytes([0xA5, 50]),  response=True)   # 50  = half
+
+asyncio.run(main())
+```
+
+```javascript
+// JavaScript, raw Web Bluetooth (must run from a user gesture)
+const dev = await navigator.bluetooth.requestDevice({
+  filters: [{ name: 'Narbis_Edge' }], optionalServices: [0x00ff],
+});
+const server = await dev.gatt.connect();
+const ch = await (await server.getPrimaryService(0x00ff)).getCharacteristic(0xff01);
+await ch.writeValueWithResponse(new Uint8Array([0xA5, 50]));   // 0 clear .. 100 dark
+```
+
+Or the SDK one-liner — same wire command, validated and serialized for you:
+
+```python
+async with Glasses() as glasses:          # JS: await glasses.setStatic(50)
+    await glasses.set_static(50)          # 0 clear .. 100 dark
+```
+
 The core integration is **direct tint control — a wearable screen dimmer**. Classic neurofeedback dims the training display when the trainee falls out of condition and clears it when they're in condition; the Edge does the same thing on the lens itself, so it drops into **any protocol** (SMR, alpha/theta, HEG, EMG down-training, HRV…) wherever your software can emit a feedback value.
 
 **How real-time control works.** Open one BLE connection and hold it. Every time your feedback signal updates, write the lens opacity — a single 2-byte command, `set_static(duty)`, where `duty` runs **0 (clear) → 100 (fully dark)**. That's the same 0–100% dim level your on-screen dimmer already computes, so you point the existing signal at the lens instead of the screen. The streaming contract:
 
-- **Rate (proportional feedback):** the BLE link runs on a 20–30 ms connection interval (~33–50 connection events/sec — the glasses request it; the host **OS BLE stack** grants it, and your application can't change it), so the transport can carry more writes than a dimmer needs. Stream a continuously-varying tint at **~12 Hz**: the production-proven application rate, with link headroom left for status notifications and retries. 20 Hz is the documented ceiling. Decimate a faster signal (a 256 Hz EEG index, say) — you don't need a write per sample. **This 12 Hz is a smoothing cadence, not a reward-latency floor** (see below).
+- **Rate (proportional feedback):** the firmware applies every commanded static duty on its 10 ms tick (100 Hz internally, no command throttling), so the **BLE link** is the only limit. The glasses request a 20–30 ms connection interval with slave latency 1 (~33–50 connection events/sec). A host that accepts those defaults sustains only **~8–11 writes/sec**; a host that requests throughput-optimized connection parameters (e.g. WinRT `RequestPreferredConnectionParameters(ThroughputOptimized)`, held for the session) reaches **~20 writes/sec** (both measured on real glasses, fw 4.16.2, Windows laptop). The hard ceiling is the connection-event rate; reaching the full **30–50 Hz** band additionally needs firmware write-without-response on `0xFF01` (planned, not yet shipped — `0xFF01` is write-with-response only today). **Recommended: target 30–50 Hz with coalescing on** — the effective rate self-limits to your data rate, and since most sources emit ≤ 16–30 new values/sec, coalesced writes rarely reach the ceiling. Decimate a faster signal (a 256 Hz EEG index, say) — you don't need a write per sample.
 - **Coalesce:** skip the write when `duty` hasn't changed since the last one — the lens holds its state, so only send real changes.
-- **One in flight:** never overlap writes to the control characteristic (on raw BLE, wait for each write to complete before sending the next).
+- **One in flight:** never overlap writes to the control characteristic (on raw BLE, wait for each write to complete before sending the next). Write-with-response paces throughput for you — the configured rate is a *target*, never a queue.
 - **Latency:** each write lands on the lens in ~1–2 connection intervals (**~20–60 ms transport**), then the lens itself switches in **Ton 2.5–40 ms / Toff 2.5–50 ms** (< 100 ms only when cold) — a fast cell, not the bottleneck. By default `set_static()` applies immediately (the breathe slew limiter doesn't touch static); if you enable the optional on-device smoothing / slew cap (`0xA0` / `0xA1`, fw ≥ 4.15.7) those deliberately stretch the transition.
 
-> ### Reward timing / operant conditioning
-> A **continuous dimmer** and a **discrete reward** have different latency needs, and the 12 Hz cadence only governs the first. For proportional feedback, 12 Hz updates (~83 ms granularity) sit far below your upstream EEG analysis window (typically 250 ms–1 s+), which dominates the loop. For a **discrete reinforcement** — a reward the instant a contingency is met — don't wait for the next stream tick: fire the write immediately. The reward path is then just **~20–60 ms transport + ~40–50 ms lens switch** (Ton ≤ 40 / Toff ≤ 50 ms; < 100 ms only when cold), with the analysis window as the only larger term. So the reinforcement latency is bounded by your signal processing, **not** by the 12 Hz streaming rate. (The SDK's `reward_event()` does exactly this — see below.)
+> **Why not 12 or 20 Hz?** Earlier docs cited a "12 Hz" rate and a "20 Hz ceiling." The 12 Hz was only the on-board **breathe pacer** cadence (the reference app's paced-breathing update rate), never a lens-control limit; the "20 Hz ceiling" was a stale, overly-conservative figure with no basis in the protocol. The real limit is the BLE link, described above.
 
-**The SDKs ship this whole contract as a built-in:** `start_feedback_stream()` returns a `FeedbackStream`. For proportional feedback, call `feed_reward(value)` (0..1, 1 = in condition) or `feed(duty)` (0–100, your dimmer's existing scale) from any callback at any rate — the internal writer handles 12 Hz decimation, coalescing, and write serialization. For a discrete operant reward, call **`reward_event(duty=0, hold_ms=…)`**, which writes immediately (bypassing the tick, preempting the stream) so reinforcement isn't gated by the streaming cadence. The snippets below are complete screen-dimmer replacements; for the hand-rolled loop or the raw-BLE byte sequence, see the [protocol doc quickstart](docs/bluetooth-protocol.md).
+> ### Reward timing / operant conditioning
+> A **continuous dimmer** and a **discrete reward** have different latency needs, and the streaming cadence only governs the first. For proportional feedback, 30 Hz updates (~33 ms granularity) sit far below your upstream EEG analysis window (typically 250 ms–1 s+), which dominates the loop. For a **discrete reinforcement** — a reward the instant a contingency is met — don't wait for the next stream tick: fire the write immediately. The reward path is then just **~20–60 ms transport + ~40–50 ms lens switch** (Ton ≤ 40 / Toff ≤ 50 ms; < 100 ms only when cold), with the analysis window as the only larger term. So the reinforcement latency is bounded by your signal processing, **not** by the streaming rate. (The SDK's `reward_event()` does exactly this — see below.)
+
+**The SDKs ship this whole contract as a built-in:** `start_feedback_stream()` returns a `FeedbackStream`. For proportional feedback, call `feed_reward(value)` (0..1, 1 = in condition) or `feed(duty)` (0–100, your dimmer's existing scale) from any callback at any rate — the internal writer handles 30 Hz decimation, coalescing, and write serialization. For a discrete operant reward, call **`reward_event(duty=0, hold_ms=…)`**, which writes immediately (bypassing the tick, preempting the stream) so reinforcement isn't gated by the streaming cadence. The snippets below are complete screen-dimmer replacements; for the hand-rolled loop or the raw-BLE byte sequence, see the [protocol doc quickstart](docs/bluetooth-protocol.md).
 
 ### Python
 ```bash
@@ -86,7 +125,7 @@ import asyncio
 async def main():
     async with Glasses() as glasses:
         await glasses.set_duration(60)                 # session guard: no auto-sleep for 60 min
-        stream = glasses.start_feedback_stream()       # 12 Hz writer -- coalesces + serializes for you
+        stream = glasses.start_feedback_stream()       # 30 Hz writer -- coalesces + serializes for you
         your_pipeline.on_update(stream.feed_reward)    # push your 0..1 feedback value, any callback, any rate
         # or stream.feed(duty) with your dimmer's existing 0-100% value
         await asyncio.Event().wait()                   # run until you end the session
@@ -105,7 +144,7 @@ import { Glasses } from 'edge-glasses';
 const glasses = new Glasses();
 await glasses.connect();                       // must come from a user gesture
 await glasses.setDuration(60);                 // session guard
-const stream = glasses.startFeedbackStream();  // 12 Hz writer -- coalesces + serializes for you
+const stream = glasses.startFeedbackStream();  // 30 Hz writer -- coalesces + serializes for you
 onFeedback((v) => stream.feedReward(v));       // push your 0..1 feedback value, any callback, any rate
 ```
 
@@ -165,7 +204,7 @@ Simple byte-based protocol for direct integration. Service `0x00FF`, control cha
 | Opacity (legacy) | `[0x00-0xFF]` | Single byte = lens opacity 0-255; stops current mode |
 | Lens smoothing | `[0xA0, tau]` | EMA glide between streamed targets, τ ×10 ms, 0 = off (persisted; fw 4.15.7+) |
 | Lens max rate | `[0xA1, rate]` | Transition-speed cap %/100ms, 0 = unlimited (persisted; fw 4.15.7+) |
-| Brightness | `[0xA2, pct]` | Level 0-100% (persisted) — writes the same variable as `0xA5` and sets breathe depth; not a max/ceiling |
+| Brightness | `[0xA2, pct]` | Level 0-100% (persisted) — the max-tint / breathe depth that scales breathe & strobe output. On fw ≥ 4.16.2 `0xA5` no longer writes it (clean static); on fw ≤ 4.16.1 `0xA5` and `0xA2` shared one variable |
 | On-disconnect | `[0xA3, mode]` | 0 = freeze at last output (default) / 1 = fail clear on link loss (persisted; fw 4.15.7+) |
 | Duration | `[0xA4, minutes]` | Session length 1-60 min, auto-sleep at end (persisted) |
 | Static | `[0xA5, duty]` | Static mode at duty 0-100% |
@@ -220,13 +259,13 @@ Presets are fixed-parameter: the firmware no longer ramps strobe frequency or gr
 
 ### Real-time control
 
-Update opacity for smooth neurofeedback — at ~12 Hz (the production-proven rate; ~20 Hz is only a tolerated ceiling):
+Update opacity for smooth neurofeedback — stream at 30 Hz (the SDK's default `FeedbackStream` rate; see the [rate contract](#quick-start) for why there's no 12/20 Hz limit):
 
 ```python
 while True:
     alpha = get_eeg_alpha()  # Your processing
     await glasses.set_opacity(int(alpha * 255))
-    await asyncio.sleep(1 / 12)  # ~12 Hz
+    await asyncio.sleep(1 / 30)  # ~30 Hz
 ```
 
 For breathing entrainment, prefer the on-board breathe engine (configure, start, optionally `syncBreath()` once per breath at the cycle boundary) over streaming per-tick opacity.

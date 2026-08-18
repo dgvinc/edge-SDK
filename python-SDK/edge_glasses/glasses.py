@@ -31,6 +31,10 @@ SERVICE_UUID = "000000ff-0000-1000-8000-00805f9b34fb"
 CHAR_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
 DEVICE_NAME = "Narbis_Edge"
 
+# Standard BLE Battery Service (firmware >= 4.16.1 on V1.2+ hardware)
+BATTERY_SERVICE_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
+BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
+
 
 class Waveform(IntEnum):
     """Breathe waveform shape (opcode 0xB5)"""
@@ -256,7 +260,14 @@ class Glasses:
         write as a direct opacity command (0-255 -> 0-100% static duty).
         Stops whatever mode is currently running.
 
-        Stream at ~12 Hz for continuous biofeedback (~20 Hz is the tolerated ceiling).
+        Stream this for continuous real-time feedback. There is no 20 Hz
+        protocol ceiling (that figure was a stale conservative doc value);
+        target a configurable 30-50 Hz band with coalescing on. The BLE link
+        paces you - write-with-response keeps exactly one write in flight, so
+        the effective rate self-limits to your data rate (measured ~8-11
+        writes/sec on default connection parameters, ~20/sec with
+        throughput-optimized params). The old "12 Hz" was only the on-board
+        breathe-pacer cadence, not a lens-control limit.
 
         Args:
             value: Opacity 0-255 (0=clear, 255=full dark)
@@ -283,12 +294,20 @@ class Glasses:
 
     async def set_brightness(self, percent: int) -> None:
         """
-        Set the lens level / breathe depth (0xA2)
+        Set the persistent max-tint / breathe depth (0xA2)
 
-        Persisted in NVS across power cycles. Does not change mode.
-        Writes the SAME firmware variable as set_static() -- it is not a
-        ceiling that clamps later set_static() writes; a later set_static()
-        simply overwrites it.
+        Persisted in NVS across power cycles. Does not change mode. This is
+        the master tint level that MULTIPLIES the breathe / strobe / static
+        output.
+
+        On firmware >= 4.16.2 this is decoupled from set_static(): 0xA2 owns
+        brightness alone, and set_static() (0xA5) is a clean static-duty
+        write that does NOT touch it - so you can stream real-time dimming to
+        0 without zeroing the depth of the other programs. On firmware <=
+        4.16.1 the two shared one variable (a set_static() to 0 left
+        brightness at 0, so later breathe/strobe rendered clear until 0xA2
+        was re-sent); 4.16.2 fixes this and self-heals a persisted brightness
+        of 0 at boot.
 
         Args:
             percent: Brightness 0-100%
@@ -300,9 +319,17 @@ class Glasses:
         """
         Enter static mode at a fixed duty cycle (0xA5)
 
-        Stops the current mode and holds the lens at the given tint.
+        Stops the current mode and holds the lens at the given tint - the
+        primary real-time dimming command. On firmware >= 4.16.2 this is a
+        clean static-duty write that does NOT touch the 0xA2 brightness /
+        breathe depth (see set_brightness()).
+
         Note: duty 1-100% maps to a perceptual floor on the device
         (raw 265-1023); 0 is fully clear.
+
+        For a smooth timed fade to a target, pair with set_lens_max_rate()
+        (an on-device slew ramp) or set_lens_smoothing() (an EMA glide
+        between writes) - see those methods.
 
         Args:
             duty: Duty cycle 0-100%
@@ -356,10 +383,13 @@ class Glasses:
 
         Persisted in NVS. The firmware glides between commanded static
         targets (set_static / set_opacity / the disconnect fail-clear)
-        with an EMA of this time constant, so a low-rate or lossy
-        feedback stream renders as smooth motion instead of steps.
-        Rule of thumb: 1-2x your write period (12 Hz stream -> 80-160 ms).
-        Does not affect breathe/strobe waveforms.
+        with an EMA of this time constant, so the lens moves continuously
+        between your writes instead of stepping - the RECOMMENDED way to get
+        smooth real-time feedback and to absorb per-sample noise without
+        filtering client-side. Send it once at connect.
+        Rule of thumb: tau ~= 1-2x your write period (a 30 Hz stream is a
+        ~33 ms period -> ~35-70 ms; ~80 ms is a good general value). Affects
+        commanded static duty only, not breathe/strobe waveforms.
 
         For a CONTINUOUS stream, use firmware >= 4.15.9: 4.15.7 stalls
         ~2-4% short of each target (fixed in 4.15.8), and through 4.15.8
@@ -544,6 +574,57 @@ class Glasses:
         await self._send(bytes([0xBF, 0x00]))
 
     # -------------------------------------------------------------------------
+    # Battery (firmware >= 4.16.1 on V1.2+ hardware)
+    # -------------------------------------------------------------------------
+
+    async def get_battery(self) -> Optional[int]:
+        """
+        Read the battery charge level over the standard BLE Battery Service
+
+        Reads Battery Level (``0x2A19``) from the standard Battery Service
+        (``0x180F``), which firmware >= 4.16.1 exposes on V1.2+ hardware.
+
+        Returns:
+            Battery charge 0-100 (percent), or ``None`` if the device does
+            not expose the ``0x180F`` Battery Service (pre-4.16.1 firmware,
+            or a board built without the battery divider).
+
+        Note:
+            On firmware >= 4.16.1 the ``0x2A19`` characteristic is registered
+            on every unit but **reads 0 while the level is unknown** - it
+            cannot distinguish "unknown" from a genuine 0%. If you need to
+            tell those apart (or want millivolts / a charging flag), read the
+            ``0xFB`` status frame on ``0xFF03`` instead:
+            ``[mv:u16 LE][soc:u8][charging:u8]``, where ``soc = 0xFF`` means
+            unknown/unsupported (see the protocol doc). A board without the
+            divider reports unsupported there (mv=0, soc=0xFF, charging=0xFF),
+            so treat a missing ``0x180F`` service or a persistent 0 as
+            "battery not available on this unit."
+
+        Example:
+            level = await glasses.get_battery()
+            if level is None:
+                print("battery not available on this unit")
+            else:
+                print(f"battery: {level}%")
+        """
+        if not self.is_connected:
+            raise ConnectionError("Not connected. Call connect() first.")
+
+        service = self._client.services.get_service(BATTERY_SERVICE_UUID)
+        if service is None:
+            return None    # pre-4.16.1 firmware / no battery service
+
+        try:
+            data = await self._client.read_gatt_char(BATTERY_LEVEL_UUID)
+        except BleakError as e:
+            raise CommandError(f"Battery read failed: {e}")
+
+        if not data:
+            return None
+        return max(0, min(100, data[0]))
+
+    # -------------------------------------------------------------------------
     # Preset Sessions
     # -------------------------------------------------------------------------
     # Fixed-parameter presets: the firmware no longer ramps any parameter
@@ -609,15 +690,18 @@ class Glasses:
     # Real-time Feedback Streaming
     # -------------------------------------------------------------------------
 
-    def start_feedback_stream(self, rate_hz: float = 12.0) -> "FeedbackStream":
+    def start_feedback_stream(self, rate_hz: float = 30.0) -> "FeedbackStream":
         """
         Open a plug-and-play real-time lens stream (the screen-dimmer pattern)
 
         Returns a FeedbackStream: push a value from any callback at any
         rate via feed() / feed_reward(); a background task writes the lens
-        at ``rate_hz`` (default ~12 Hz, the production-proven rate),
+        at ``rate_hz`` (default ~30 Hz real-time target, capped at 45 Hz),
         coalescing unchanged values and keeping exactly one write in
         flight. Replaces a hand-rolled decimate/coalesce/serialize loop.
+        The rate is a target, never a queue: write-with-response keeps one
+        write in flight, so the effective rate self-limits to your data rate
+        (the BLE link, not the firmware, is the throughput limit).
 
         Proportional feedback (a dimmer that tracks your signal) uses
         feed() / feed_reward(); discrete operant rewards use reward_event(),
@@ -648,9 +732,9 @@ class FeedbackStream:
     the coalesce key so the next tick retries.
     """
 
-    def __init__(self, glasses: "Glasses", rate_hz: float = 12.0):
+    def __init__(self, glasses: "Glasses", rate_hz: float = 30.0):
         self._glasses = glasses
-        self._interval = 1.0 / max(1.0, min(20.0, rate_hz))  # 20 Hz ceiling
+        self._interval = 1.0 / max(1.0, min(45.0, rate_hz))  # 45 Hz cap
         self._duty: Optional[int] = None    # latest requested duty, 0-100
         self._last_sent = -1
         self._loop = asyncio.get_running_loop()

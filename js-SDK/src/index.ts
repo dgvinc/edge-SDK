@@ -7,13 +7,17 @@
  * firmware's breathe / static / strobe renderer.
  *
  * @module edge-glasses
- * @version 2.2.0
+ * @version 2.3.0
  */
 
 // BLE UUIDs
 const SERVICE_UUID = 0x00ff;
 const CHAR_UUID = 0xff01;
 const DEVICE_NAME = 'Narbis_Edge';
+
+// Standard BLE Battery Service (firmware >= 4.16.1 on V1.2+ hardware)
+const BATTERY_SERVICE_UUID = 0x180f;
+const BATTERY_LEVEL_UUID = 0x2a19;
 
 /**
  * Breathe waveform shapes (opcode 0xB5).
@@ -126,10 +130,12 @@ export class Glasses {
     }
 
     try {
-      // Request device (exact-name match, service UUID as fallback)
+      // Request device (exact-name match, service UUID as fallback).
+      // Battery service listed as optional so getBattery() may access it on
+      // firmware >= 4.16.1 (V1.2+ hardware); harmless if absent.
       this.device = await navigator.bluetooth.requestDevice({
         filters: [{ name: DEVICE_NAME }, { services: [SERVICE_UUID] }],
-        optionalServices: [SERVICE_UUID]
+        optionalServices: [SERVICE_UUID, BATTERY_SERVICE_UUID]
       });
 
       if (!this.device.gatt) {
@@ -229,8 +235,13 @@ export class Glasses {
    * Stops any running mode and holds a static tint.
    *
    * This is the ONE command that is intentionally a single byte on the
-   * wire - the firmware treats any 1-byte write as opacity. Fine to
-   * stream at ~12 Hz for continuous biofeedback (~20 Hz is the tolerated ceiling).
+   * wire - the firmware treats any 1-byte write as opacity. Stream this for
+   * continuous real-time feedback: there is no 20 Hz protocol ceiling (that
+   * was a stale conservative doc figure) - target a configurable 30-50 Hz
+   * band with coalescing on. Write-with-response keeps one write in flight,
+   * so throughput self-limits to your data rate (measured ~8-11 writes/sec
+   * on default connection parameters, ~20/sec with throughput-optimized
+   * params). The old "12 Hz" was only the on-board breathe-pacer cadence.
    *
    * Value is clamped to 0-255 client-side (firmware never NACKs).
    *
@@ -257,11 +268,20 @@ export class Glasses {
 
   /**
    * Enter static mode at a fixed duty cycle (opcode 0xA5).
-   * Stops any running mode. Not persisted.
+   * Stops any running mode. Not persisted. The primary real-time dimming
+   * command.
+   *
+   * On firmware >= 4.16.2 this is a clean static-duty write that does NOT
+   * touch the 0xA2 brightness / breathe depth (see {@link setBrightness}),
+   * so you can stream dimming to 0 without zeroing other programs.
    *
    * Duty 1-100 % maps to a perceptually-floored raw range on the device
    * (fw >= 4.15.4); 0 = fully clear. Clamped to 0-100 client-side
    * (firmware never NACKs).
+   *
+   * For a smooth timed fade to a target, pair with {@link setLensMaxRate}
+   * (an on-device slew ramp) or {@link setLensSmoothing} (an EMA glide
+   * between writes).
    *
    * @param duty Duty cycle 0-100 %
    */
@@ -275,9 +295,17 @@ export class Glasses {
   // -------------------------------------------------------------------------
 
   /**
-   * Set the lens level / breathe depth (opcode 0xA2). Persisted in NVS.
-   * Writes the SAME firmware variable as setStatic() — it is not a ceiling
-   * that clamps later setStatic() writes; a later setStatic() overwrites it.
+   * Set the persistent max-tint / breathe depth (opcode 0xA2). Persisted in
+   * NVS. This is the master tint level that MULTIPLIES the breathe / strobe /
+   * static output.
+   *
+   * On firmware >= 4.16.2 this is decoupled from setStatic(): 0xA2 owns
+   * brightness alone and setStatic() (0xA5) no longer touches it, so
+   * streaming dimming to 0 does not zero the depth of other programs. On
+   * firmware <= 4.16.1 the two shared one variable (a setStatic() to 0 left
+   * brightness at 0, so later breathe/strobe rendered clear until 0xA2 was
+   * re-sent); 4.16.2 fixes this and self-heals a persisted brightness of 0
+   * at boot.
    *
    * Clamped to 0-100 client-side (firmware never NACKs).
    *
@@ -310,9 +338,12 @@ export class Glasses {
    *
    * The firmware glides between commanded static targets (setStatic /
    * setOpacity / the disconnect fail-clear) with an EMA of this time
-   * constant, so a low-rate or lossy feedback stream renders as smooth
-   * motion instead of steps. Rule of thumb: 1-2x your write period
-   * (12 Hz stream -> 80-160 ms). Breathe/strobe waveforms unaffected.
+   * constant, so the lens moves continuously between your writes instead of
+   * stepping - the RECOMMENDED way to get smooth real-time feedback and to
+   * absorb per-sample noise without filtering client-side. Send it once at
+   * connect. Rule of thumb: tau ~= 1-2x your write period (a 30 Hz stream is
+   * a ~33 ms period -> ~35-70 ms; ~80 ms is a good general value). Affects
+   * commanded static duty only; breathe/strobe waveforms unaffected.
    *
    * For a CONTINUOUS stream, use firmware >= 4.15.9: 4.15.7 stalls ~2-4%
    * short of each target (fixed in 4.15.8), and through 4.15.8 the smoothed
@@ -502,6 +533,42 @@ export class Glasses {
   }
 
   // -------------------------------------------------------------------------
+  // Battery (firmware >= 4.16.1 on V1.2+ hardware)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Read the battery charge level over the standard BLE Battery Service.
+   *
+   * Reads Battery Level (0x2A19) from the standard Battery Service (0x180F),
+   * which firmware >= 4.16.1 exposes on V1.2+ hardware.
+   *
+   * On firmware >= 4.16.1 the 0x2A19 characteristic is registered on every
+   * unit but **reads 0 while the level is unknown** - it cannot distinguish
+   * "unknown" from a genuine 0%. If you need to tell those apart (or want
+   * millivolts / a charging flag), read the 0xFB status frame on 0xFF03
+   * instead: [mv:u16 LE][soc:u8][charging:u8], where soc = 0xFF means
+   * unknown/unsupported (see the protocol doc). Treat a null result or a
+   * persistent 0 as "battery not available on this unit."
+   *
+   * @returns Battery charge 0-100 (percent), or null if the device does not
+   *   expose the 0x180F Battery Service (pre-4.16.1 firmware, or a board
+   *   built without the battery divider).
+   */
+  async getBattery(): Promise<number | null> {
+    if (!this.isConnected || !this.server) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    try {
+      const service = await this.server.getPrimaryService(BATTERY_SERVICE_UUID);
+      const characteristic = await service.getCharacteristic(BATTERY_LEVEL_UUID);
+      const value = await characteristic.readValue();
+      return value.getUint8(0);
+    } catch {
+      return null;   // service/characteristic absent: battery not available
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Preset Sessions
   // -------------------------------------------------------------------------
   // Presets are fixed-parameter: the firmware no longer ramps frequency or
@@ -559,9 +626,12 @@ export class Glasses {
    *
    * Returns a FeedbackStream: push a value from any callback at any rate via
    * feed() / feedReward(); an internal writer updates the lens at `rateHz`
-   * (default ~12 Hz, the production-proven rate; capped at 20 Hz), coalescing
-   * unchanged values and keeping exactly one BLE write in flight. Replaces a
-   * hand-rolled decimate/coalesce/serialize loop.
+   * (default ~30 Hz real-time target; capped at 45 Hz), coalescing unchanged
+   * values and keeping exactly one BLE write in flight. Replaces a
+   * hand-rolled decimate/coalesce/serialize loop. The rate is a target, not
+   * a queue: write-with-response keeps one write in flight, so throughput
+   * self-limits to your data rate (the BLE link, not the firmware, is the
+   * limit).
    *
    * Proportional feedback (a dimmer that tracks your signal) uses feed() /
    * feedReward(); discrete operant rewards use rewardEvent(), which fires
@@ -575,7 +645,7 @@ export class Glasses {
    * await stream.stop();                // stops the writer and clears the lens
    * ```
    */
-  startFeedbackStream(rateHz = 12): FeedbackStream {
+  startFeedbackStream(rateHz = 30): FeedbackStream {
     return new FeedbackStream(this, rateHz);
   }
 }
@@ -596,8 +666,8 @@ export class FeedbackStream {
   private holdUntil = 0;                // Date.now() until which a reward tint holds
   private timer: ReturnType<typeof setInterval>;
 
-  constructor(private glasses: Glasses, rateHz = 12) {
-    const hz = Math.max(1, Math.min(20, rateHz)); // 20 Hz ceiling
+  constructor(private glasses: Glasses, rateHz = 30) {
+    const hz = Math.max(1, Math.min(45, rateHz)); // 45 Hz cap
     this.timer = setInterval(() => this.tick(), 1000 / hz);
   }
 

@@ -2,7 +2,7 @@
 
 > **Audience.** Developers speaking the wire protocol directly — **Python** (via [bleak](https://github.com/hbldh/bleak)) or **JavaScript** (via Web Bluetooth) — whether you're using the edge-SDK libraries or bypassing them. Everything a client needs to talk to the **Narbis Edge** glasses and the **Narbis Earclip** over BLE is in this document.
 >
-> **Provenance.** Synced to glasses firmware **4.15.7+** and earclip firmware **config v4** — July 2026.
+> **Provenance.** Synced to glasses firmware **4.16.2+** and earclip firmware **config v4** — August 2026.
 >
 > **Scope.** Scanning, connecting, GATT discovery, command writes, notification parsing, driving the lens ([§4.6](#46-driving-the-edge-lens)), OTA firmware update, troubleshooting.
 >
@@ -33,12 +33,57 @@
 
 The minimal path for a third party whose software already produces a feedback value (0..1) and wants the lens to track it. This is the **wearable screen-dimmer** pattern: classic neurofeedback dims the training display when the trainee falls out of condition and clears it when they're in condition — the Edge does the same on the lens itself, so it drops into **any protocol** (SMR, alpha/theta, HEG, EMG down-training, HRV…) with no changes to the protocol logic.
 
+### Connect and set opacity — the copy-paste minimum
+
+Before the streaming loop, here is the absolute minimum: wake the glasses (magnet tap), connect, and set the lens to any opacity. `duty` is `0` fully clear … `50` half … `100` fully dark.
+
+Python ([bleak](https://github.com/hbldh/bleak)):
+
+```python
+import asyncio
+from bleak import BleakScanner, BleakClient
+
+CTRL = '0000ff01-0000-1000-8000-00805f9b34fb'   # Edge Control characteristic (service 0x00FF)
+
+async def main():
+    dev = await BleakScanner.find_device_by_name('Narbis_Edge', timeout=15.0)  # magnet-tap to wake first
+    async with BleakClient(dev) as client:
+        await client.write_gatt_char(CTRL, bytes([0xA4, 60]),  response=True)   # 60-min session guard
+        await client.write_gatt_char(CTRL, bytes([0xA5, 100]), response=True)   # 100 = fully dark
+        await asyncio.sleep(2)
+        await client.write_gatt_char(CTRL, bytes([0xA5, 50]),  response=True)   # 50  = half tint
+        await asyncio.sleep(2)
+        await client.write_gatt_char(CTRL, bytes([0xA5, 0]),   response=True)   # 0   = fully clear
+
+asyncio.run(main())
+# Every write is ≥ 2 bytes (a 1-byte write is the legacy opacity command, §4.3);
+# 0xFF01 is write-with-response only, so pass response=True (§4.2).
+```
+
+JavaScript (Web Bluetooth — must run from a click handler, [§7.1](#71-web-bluetooth-gotchas)):
+
+```js
+const dev  = await navigator.bluetooth.requestDevice({
+  filters: [{ name: 'Narbis_Edge' }], optionalServices: [0x00ff] });
+const svc  = await (await dev.gatt.connect()).getPrimaryService(0x00ff);
+const ctrl = await svc.getCharacteristic(0xff01);
+await ctrl.writeValueWithResponse(new Uint8Array([0xA4, 60]));   // 60-min session guard
+await ctrl.writeValueWithResponse(new Uint8Array([0xA5, 100]));  // 100 = fully dark
+// …[0xA5, 50] = half, [0xA5, 0] = clear. Every write is ≥ 2 bytes; 0xFF01 is write-with-response only.
+```
+
+With the SDK it's a one-liner once connected — `glasses.set_opacity(1.0)` (or `set_static(100)`) for fully dark, `set_opacity(0.0)` for clear; see the [Python SDK API](../python-SDK/docs/API_REFERENCE.md).
+
+### Stream it — make the lens track a live signal
+
+The same write wired into a real-time loop is the actual biofeedback pattern:
+
 1. **Wake the glasses** — magnet tap on the temple. You get a ~2-minute advertising window.
 2. **Scan** for the exact name `Narbis_Edge` (the service UUID is not advertised) and connect.
 3. **Discover** service `0x00FF`, characteristic `0xFF01` (Control).
 4. **Write `[0xA4, 0x3C]`** — a 60-minute session guard, so the auto-sleep timer doesn't end your session early ([§4.1.2](#412-session-auto-sleep--the-0xa4-timer)).
-5. **Loop at ≤ 12 Hz:** map your signal 0..1 → duty 0..100 and write `[0xA5, duty]`. Skip the write if the duty is unchanged, and keep at most one write in flight.
-6. *(Optional, fw ≥ 4.15.7)* **Write `[0xA0, 0x0A]`** once — 100 ms of on-device smoothing, so the lens glides between your stream's steps instead of stepping ([§4.3](#43-control-characteristic-0xff01--command-opcodes)). Persisted; older firmware ignores it.
+5. **Loop toward a 30 Hz target:** map your signal 0..1 → duty 0..100 and write `[0xA5, duty]`. Skip the write if the duty is unchanged, and keep at most one write in flight — the write-with-response round-trip self-throttles to whatever the link sustains (~8–11 writes/sec on default connection params, ~20/sec with throughput-optimized params; full rate story in [§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern)).
+6. *(Optional, fw ≥ 4.15.8)* **Write `[0xA0, 0x08]`** once — ~80 ms of on-device EMA smoothing, so the lens glides between your stream's steps instead of stepping ([§4.3](#43-control-characteristic-0xff01--command-opcodes)). Persisted; older firmware ignores it.
 
 Sanity test: `[0xA5, 0x64]` = fully dark, `[0xA5, 0x00]` = fully clear.
 
@@ -60,7 +105,7 @@ async def run(get_signal):                    # get_signal() → 0.0..1.0
             if duty != last:                  # coalesce: skip unchanged values
                 await client.write_gatt_char(CTRL, bytes([0xA5, duty]), response=True)  # 0xFF01 is write-with-response only
                 last = duty
-            await asyncio.sleep(1 / 12)       # ≤ 12 Hz; the await also keeps writes serialized
+            await asyncio.sleep(1 / 30)       # 30 Hz target; write-with-response self-throttles to link capacity
 ```
 
 JavaScript (Web Bluetooth — must run from a click handler, [§7.1](#71-web-bluetooth-gotchas)):
@@ -79,7 +124,7 @@ setInterval(async () => {
   try { await ctrl.writeValueWithResponse(new Uint8Array([0xA5, duty])); }  // 0xFF01 is write-with-response only (§7.1)
   catch { last = -1; }  // failed write: reset the coalesce key so the next frame retries (matches streamLensDuty)
   finally { busy = false; }
-}, 1000 / 12);
+}, 1000 / 30);   // 30 Hz target; the busy guard keeps one write in flight, self-throttling to link capacity
 ```
 
 Read before shipping:
@@ -98,8 +143,8 @@ Read before shipping:
 | MCU | ESP32 classic | ESP32-C6 |
 | BLE stack | NimBLE | NimBLE |
 | BLE roles | **peripheral + central** — the central (earclip relay) is **compile-disabled on stock builds** ([§4.7](#47-the-edge-as-relay)) | peripheral, **multi-central** (up to 3 simultaneous) |
-| Primary service | `0x00FF` (chars `0xFF01`–`0xFF04`) — its **only** service, and it is **not included in the advertising payload**: the adv data is flags + name only, so filter by device name, not by service UUID | `a24080b2-8857-4785-b3ba-a43b66af4f28` (128-bit, advertised) — plus `0x00FF` for OTA (chars `0xFF01`–`0xFF03`) |
-| Standard SIG services | none — no HRS / Battery / DIS. (Like every BLE device, service discovery will also show the mandatory GAP `0x1800` and GATT `0x1801` — ignore them.) | HRS `0x180D`, Battery `0x180F`, DIS `0x180A` |
+| Primary service | `0x00FF` (chars `0xFF01`–`0xFF04`) — its custom service (fw ≥ 4.16.1 on V1.2+ hardware additionally exposes the standard Battery Service `0x180F`), **not included in the advertising payload**: the adv data is flags + name only, so filter by device name, not by service UUID | `a24080b2-8857-4785-b3ba-a43b66af4f28` (128-bit, advertised) — plus `0x00FF` for OTA (chars `0xFF01`–`0xFF03`) |
+| Standard SIG services | **Battery `0x180F`** (Battery Level `0x2A19`) on **fw ≥ 4.16.1 / V1.2+ hardware** — otherwise none; no HRS, no DIS ([§4.4.12](#4412-glasses-battery-status-0xfb--5-b)). (Like every BLE device, service discovery will also show the mandatory GAP `0x1800` and GATT `0x1801` — ignore them.) | HRS `0x180D`, Battery `0x180F`, DIS `0x180A` |
 | Encryption / bonding | none | none |
 | Negotiated MTU | requests 247 | requests 247 |
 | Connection interval (typical) | 20–30 ms, slave latency 1, **32 s** supervision timeout | per-central, picked from the PEER_ROLE byte: DASHBOARD → LOW_LATENCY (15–30 ms), GLASSES → BATCHED (50–100 ms); **20 s** supervision timeout in both profiles — a dead link takes up to 20 s to surface |
@@ -709,7 +754,7 @@ Full Python and JS serializers — including the CRC-16-CCITT-FALSE implementati
 
 The Edge advertises one custom service, **`0x00FF`**, with four characteristics (`0xFF01`–`0xFF04`). There are no standard SIG services. The device does not advertise its service UUID in the GAP payload reliably — filter by name `Narbis_Edge`.
 
-> **No power telemetry, no version characteristic.** The Edge exposes **no Battery Service and no DIS** — glasses battery level is not readable over BLE, and there is no version characteristic to read. (The `0xF8` battery frame on `0xFF03` is the *earclip's* battery, relay builds only.) For the firmware version, subscribe to `0xFF03` and parse the `Narbis fw v…` `0xF1` log line emitted on subscribe (fw ≥ 4.12.1, [§4.4.2](#442-log-string-0xf1--variable)); only fall back to sending version-gated opcodes unconditionally with graceful fallback ([§9.3](#93-firmware-featureversion-matrix)) if that line never arrives.
+> **Battery on fw ≥ 4.16.1; still no version characteristic.** On **fw ≥ 4.16.1 with V1.2+ hardware** the Edge exposes its battery three ways: the standard **Battery Service `0x180F`** (Battery Level `0x2A19`, read + notify, 0–100), a **`0xFB` battery status frame** on `0xFF03` ([§4.4.12](#4412-glasses-battery-status-0xfb--5-b)), and a **`0xC7` battery-poll** opcode ([§4.3](#43-control-characteristic-0xff01--command-opcodes)) — older firmware and boards without the sense divider report unsupported. The Edge still exposes **no DIS** and has **no version characteristic**: for the firmware version, subscribe to `0xFF03` and parse the `Narbis fw v…` `0xF1` log line emitted on subscribe (fw ≥ 4.12.1, [§4.4.2](#442-log-string-0xf1--variable)); only fall back to sending version-gated opcodes unconditionally with graceful fallback ([§9.3](#93-firmware-featureversion-matrix)) if that line never arrives. (The `0xF8` battery frame on `0xFF03` is the *earclip's* battery, relay builds only — distinct from the glasses `0xFB` frame.)
 
 ### 4.1 Advertising / connection parameters
 
@@ -730,7 +775,7 @@ The Edge advertises one custom service, **`0x00FF`**, with four characteristics 
 
 #### 4.1.1 Standalone programs & magnet gestures
 
-The glasses work without any app. A short magnet tap (0.15–4 s) on the temple cycles three sensor-free programs; the lens signals the new program with N slow fade-dark pulses:
+The glasses work without any app. A short magnet tap (0.15–4 s) on the temple cycles three sensor-free programs; on change the lens signals the new program with N slow fade-dark pulses — **except program 1, which is silent on fw ≥ 4.16.1** (only programs 2+ pulse on change; older firmware also pulsed once for program 1):
 
 | Program | Behavior |
 |---|---|
@@ -775,7 +820,7 @@ Both `0xFF03` and `0xFF04` have a CCCD descriptor (`0x2902`) — enable it with 
 >
 > Any **1-byte write is interpreted as the legacy opacity command**: the byte is a direct lens duty, `0–255` → `0–100 %`, and it **stops whatever mode is running**. A bare `[0xA6]` or `[0xA7]` is treated as an opacity write of 166 or 167 — not a command. **Pad argument-less opcodes with `0x00`**: `[0xA6, 0x00]`, `[0xA7, 0x00]`.
 >
-> The legacy opacity write is also a feature: it's the cheapest way to set a static tint, streamable for continuous feedback under the same cadence rules as [§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern) — **~10–12 Hz recommended (12 Hz is the production-proven rate); the link tolerates up to ~20 Hz only as a ceiling**. `0x00` = fully clear, `0xFF` = fully dark. Not persisted.
+> The legacy opacity write is also a feature: it's the cheapest way to set a static tint, streamable for continuous feedback under the same cadence rules as [§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern) — **target 30–50 Hz with coalescing and one write in flight; the BLE link (not a protocol ceiling) sets the real rate — ~8–11 writes/sec on default connection params, ~20/sec with throughput-optimized params**. `0x00` = fully clear, `0xFF` = fully dark. Not persisted.
 
 > ### 🚨 CRITICAL — serialize all writes to `0xFF01`
 >
@@ -786,12 +831,12 @@ Most commands are a 2-byte write `[opcode, arg]`. The firmware **never sends a G
 | Opcode | Name | Arg | Persisted? | Notes |
 |---|---|---|---|---|
 | *(1 byte)* | Legacy opacity | 0–255 → 0–100 % static duty | no | Stops the current mode; see warning above |
-| `0xA0` | Lens smoothing | 0–255 (EMA τ, ×10 ms → 0–2.55 s; 0 = off) | yes (NVS) | fw ≥ 4.15.7, older fw ignores ([§9.3](#93-firmware-featureversion-matrix)). On-device glide between **commanded static** targets (`0xA5`, the 1-byte opacity write, the `0xA3` fail-clear) — a low-rate or lossy feedback stream ([§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern)) renders as a glide instead of steps. Set τ ≈ 1–2× your write period (12 Hz stream → ~80–160 ms → arg 8–16). **Use fw ≥ 4.15.9 for a continuous stream:** 4.15.7 re-seeds the EMA on every write (glide stalls ~2–4 % short, fixed in 4.15.8), and through 4.15.8 the smoothed output was still requantized to the 101-level integer-duty grid (visible ~1 %-duty stepping) — 4.15.9 drives the lens at full 10-bit PWM resolution, so the glide is actually smooth. Strobe, breathe, and the standalone programs are unaffected. |
-| `0xA1` | Lens max transition rate | 0–100 (%/100 ms; 0 = unlimited) | yes (NVS) | fw ≥ 4.15.7, older fw ignores. Hard slew cap on commanded static transitions, applied **after** `0xA0` smoothing — a safety envelope guaranteeing the lens can't snap even if a host streams garbage (40 ≈ full-scale in 250 ms, the breathe engine's own internal limit). Does not affect breathe/strobe waveforms. |
-| `0xA2` | Set brightness | 0–100 (%) | yes (NVS) | Sets + persists the same `brightness` variable `0xA5` writes ([§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern)); doubles as breathe **depth** ([§4.6.3](#463-the-breathe-op-set)) |
+| `0xA0` | Lens smoothing | 0–255 (EMA τ, ×10 ms → 0–2.55 s; 0 = off) | yes (NVS) | fw ≥ 4.15.7, older fw ignores ([§9.3](#93-firmware-featureversion-matrix)). On-device glide between **commanded static** targets (`0xA5`, the 1-byte opacity write, the `0xA3` fail-clear) — a low-rate or lossy feedback stream ([§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern)) renders as a glide instead of steps. Set τ ≈ 1–2× your write period (a 30 Hz stream → ~33 ms → arg 3–6; arg 8 ≈ 80 ms is a good general-purpose value). **Use fw ≥ 4.15.9 for a continuous stream:** 4.15.7 re-seeds the EMA on every write (glide stalls ~2–4 % short, fixed in 4.15.8), and through 4.15.8 the smoothed output was still requantized to the 101-level integer-duty grid (visible ~1 %-duty stepping) — 4.15.9 drives the lens at full 10-bit PWM resolution, so the glide is actually smooth. Strobe, breathe, and the standalone programs are unaffected. |
+| `0xA1` | Lens max transition rate | 0–100 (%/100 ms; 0 = unlimited) | yes (NVS) | fw ≥ 4.15.7, older fw ignores. Hard slew cap on commanded static transitions, applied **after** `0xA0` smoothing — a safety envelope guaranteeing the lens can't snap even if a host streams garbage (40 ≈ full-scale in 250 ms, the breathe engine's own internal limit). Does not affect breathe/strobe waveforms. Also the on-device knob for a fixed **timed fade** — set the slew, then write the target once ([§4.6.8](#468-tint-x--y-over-z-seconds--a-timed-fade)). |
+| `0xA2` | Set brightness | 0–100 (%) | yes (NVS) | The persistent **max-tint / breathe depth** — MULTIPLIES breathe/strobe/coherence output ([§4.6.3](#463-the-breathe-op-set)). On **fw ≥ 4.16.2** `0xA2` **solely** owns `brightness`; `0xA5` no longer writes it (see the `0xA5` row + [§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern)). On **fw ≤ 4.16.1** `0xA2` and `0xA5` shared one `brightness` variable |
 | `0xA3` | On-disconnect behavior | `0x00` continue (default) / `0x01` fail clear | yes (NVS) | fw ≥ 4.15.7, older fw ignores. `0x01`: on link loss the glasses stop any strobe and drop to a clear static lens (duty 0, riding the `0xA0` glide if set) instead of freezing at the last output ([§2.5](#25-reconnection)). Fires when the firmware declares the link dead — bounded by the 32 s supervision timeout. Magnet-tap standalone programs still work afterwards. |
 | `0xA4` | Set session duration | 1–60 (minutes) | yes | Auto-sleep (deep sleep) at session end. Default 30 min; the clock runs from device wake — writing `0xA4` changes the total but does **not** restart it ([§4.1.2](#412-session-auto-sleep--the-0xa4-timer)) |
-| `0xA5` | Static LED mode | 0–100 (duty %) | no | The continuous-feedback stream opcode ([§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern)); writes the same variable as `0xA2`, without persisting |
+| `0xA5` | Static LED mode | 0–100 (duty %) | no | The continuous-feedback stream opcode ([§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern)). On **fw ≥ 4.16.2** a clean static-duty write (via `lens_apply_static`) that does **NOT** touch `brightness` or other programs — safe for real-time dimming. On **fw ≤ 4.16.1** it wrote the same `brightness` variable as `0xA2`, so streaming static dimming disturbed breathe/strobe depth. Not persisted |
 | `0xA6` | Strobe LED mode | any | no | starts strobe ISR |
 | `0xA7` | Sleep now | any | no | enters deep sleep |
 | `0xA8` | OTA START | `[size:u32 LE]` or `0x00` | no | with the image size: erases only an image-sized region (fast); `0x00` = legacy full-slot erase — see §6 |
@@ -817,10 +862,13 @@ Most commands are a 2-byte write `[opcode, arg]`. The firmware **never sends a G
 | `0xC3` | Relay config write | 50 B payload | no | Relay control — inert on stock builds. Bytes after the opcode are forwarded as a CONFIG_WRITE to the paired earclip — but the glasses firmware ships the **v3-era `NARBIS_CONFIG_WIRE_SIZE = 50`** and forwards exactly 50 B. ⚠️ **Known version mismatch:** current earclip firmware expects the 74-B config v4 payload ([§3.6](#36-the-runtime-config-struct)), so `0xC3` must not be used until the glasses relay is rebuilt against config v4 — write earclip config via a direct earclip connection instead ([§5](#5-configuring-the-earclip)). The earclip replies via CONFIG notify, which the Edge re-emits as a `0xF4` frame. |
 | `0xC4` | Toggle raw-PPG relay | `0` disable / non-zero enable | no | Relay control — inert on stock builds. Subscribes/unsubscribes the Edge's central from the earclip's RAW_PPG characteristic; while enabled, samples are forwarded as `0xF5` frames. Default: enabled at boot. |
 | `0xC5` | Refresh earclip config | any (ignored) | no | Relay control — inert on stock builds. Triggers a one-shot CONFIG read on the Edge's central; the result is re-emitted as a `0xF4` frame. Send it ~2 s after the relay reports UP if no `0xF4` arrived, and expose it as a manual "reload from earclip" action. |
+| `0xC7` | Battery poll | `0x00` refresh / `0x01` reprobe | no | fw ≥ 4.16.1 on V1.2+ hardware. `[0xC7, 0x00]` triggers a fresh battery read → a `0xFB` status frame on `0xFF03` (and refreshes `0x2A19`); `[0xC7, 0x01]` re-probes the ADC channel / dumps probe diagnostics. Boards without the sense divider report unsupported (mv 0, soc `0xFF`, charging `0xFF`). See [§4.4.12](#4412-glasses-battery-status-0xfb--5-b). |
 | `0xCA` | External-IBI injection | 4 B payload | no | Legacy pipeline ([§4.8](#48-legacy-on-board-coherence-pipeline-unused)). 5 B total on the wire: `[0xCA][ibi_ms:u16 LE][confidence:u8 0–100][flags:u8]`. Forwards an external HR source's beats into the **firmware's** coherence pipeline. Apps that compute their own feedback do **not** send this. Beats with `confidence < conf_threshold` or `flags & ARTIFACT (0x01)` are silently dropped. |
 | `0xCB` | Set HR source | 0 = earclip / 1 = external | no | Legacy pipeline. `0` resumes the Edge's central scan for the earclip; `1` pauses it so the glasses don't pull earclip beats while the app is the HR authority. Not persisted — re-assert on every connect. (Moot on stock builds — the central is compile-disabled.) |
 | `0xD0` | Manual detector reset | any | no | Legacy pipeline: clears beat-detection state |
 | `0xE0` | Coherence pipeline tuning | 12 B payload | yes (NVS) | Legacy pipeline ([§4.8](#48-legacy-on-board-coherence-pipeline-unused)). 13 B on the wire: `[0xE0]` + packed `narbis_coh_params_t`. Validation rejects out-of-grid bins and inverted lo/hi pairs; new params apply on the next coherence compute (≤ 1 s). |
+
+> **Lens-config writes confirm over BLE (fw ≥ 4.15.11).** `0xA0` / `0xA1` / `0xA3` each emit a `0xF1` text log frame on `0xFF03` when accepted — e.g. `Lens smoothing: tau=80ms (level 8)`, `Lens max rate: 5%/100ms`, `On-disconnect: fail clear`. There is still **no** config readback, but a client can watch the `0xF1` line to confirm a write landed. Older firmware applies the write silently.
 
 Python — one helper for every opcode (pads to the 2-byte minimum):
 
@@ -867,6 +915,7 @@ The Edge multiplexes several packet types onto the same characteristic, distingu
 | `0xF8` | event-driven | 5 B | Relayed earclip battery (binary) — see §4.4.9 |
 | `0xF9` | event-driven (~1 Hz per beat) | 5 B | Relayed earclip IBI (binary) — see §4.4.10 |
 | `0xFA` | every 1000 ms | 7 B | Link-quality telemetry (RSSI, MTU, drops) — see §4.4.11 |
+| `0xFB` | event-driven (`0xC7` poll) | 5 B | Glasses battery status — mv / soc / charging (fw ≥ 4.16.1, V1.2+ hardware) — see §4.4.12 |
 | `0x01`–`0x08` | event-driven | 1–7 B | OTA status — see §6 |
 
 Always subscribe to `0xFF03` **before** sending any OTA opcode, otherwise you'll miss the READY / PAGE_CRC / ERROR responses you need to drive the protocol. The relay frames `0xF4`–`0xFA` are delivered on this same characteristic, so a single subscription covers everything. (The relay frames only fire on relay-enabled builds — [§4.7](#47-the-edge-as-relay).)
@@ -1065,6 +1114,31 @@ ui.setBars(earclipRssi === 0x7F ? null : earclipRssi,
            dashboardRssi === 0x7F ? null : dashboardRssi);
 ```
 
+#### 4.4.12 Glasses battery status (`0xFB`) — 5 B
+
+**fw ≥ 4.16.1 on V1.2+ hardware.** The glasses expose their own battery two ways: the **standard BLE Battery Service `0x180F`** (Battery Level `0x2A19`, read + notify, single `u8` 0–100 — the clean, SDK-friendly path), and this richer **`0xFB` status frame** on `0xFF03`. Poll either with the `0xC7` opcode ([§4.3](#43-control-characteristic-0xff01--command-opcodes)); the `0xFB` layout mirrors the earclip relay `0xF8` ([§4.4.9](#449-relayed-earclip-battery-0xf8--5-b)) with a different type byte.
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 1 | `0xFB` | Type byte |
+| 1 | 2 | `mv` | u16 LE — battery voltage, millivolts (`0` = unknown/unsupported) |
+| 3 | 1 | `soc` | u8 — state of charge, 0–100; **`0xFF` = unknown/unsupported** |
+| 4 | 1 | `charging` | u8 — 0 = discharging, 1 = charging (`0xFF` = unknown/unsupported) |
+
+> **"Unsupported" vs. a real 0 %.** The battery pin is GPIO36 / SENSOR_VP / ADC1_CH0 on the V1.2 respin; **boards without the sense divider report `mv = 0`, `soc = 0xFF`, `charging = 0xFF`.** The standard `0x2A19` characteristic is registered on all fw ≥ 4.16.1 units but **reads `0` while the level is unknown** — it cannot distinguish "unknown" from a true 0 %. The `0xFB` frame is the authoritative source that *can* (soc `0xFF` = unknown). So treat a missing `0x180F` service — or a `soc` of `0xFF` — as "battery not available on this unit," and read the `0xFB` frame when you need millivolts, charging state, or a real unknown flag.
+
+Python:
+
+```python
+def parse_glasses_battery(data: bytes):
+    mv, soc, charging = struct.unpack_from('<HBB', data, 1)   # data[0] == 0xFB
+    return {
+        'mv':       mv or None,                               # 0 = unknown/unsupported
+        'soc':      None if soc == 0xFF else soc,             # 0xFF = unknown; else 0–100
+        'charging': None if charging == 0xFF else bool(charging),
+    }
+```
+
 ### 4.5 PPG stream characteristic `0xFF04`
 
 > **Not emitted on current firmware (4.15.6+)** — the on-glasses PPG front-end is removed; subscribing yields silence. Layout kept for reference (it may return on future hardware).
@@ -1141,20 +1215,31 @@ Detect by reading the type byte; both share characteristic `0xFF04`.
 
 ### 4.6 Driving the Edge lens
 
-Your app owns the feedback algorithm and tells the lens what to do. This section is the complete drive surface: continuous-opacity feedback, how to make the lens breathe, how to strobe, the opacity curve, and — the part that bites everyone — how to keep the lens **in phase** with your on-screen cue and audio.
+Your app owns the feedback algorithm and tells the lens what to do. This section is the complete drive surface: continuous-opacity feedback, timed fades (tint X→Y over Z seconds, [§4.6.8](#468-tint-x--y-over-z-seconds--a-timed-fade)), how to make the lens breathe, how to strobe, the opacity curve, and — the part that bites everyone — how to keep the lens **in phase** with your on-screen cue and audio.
 
 #### 4.6.1 Continuous-opacity feedback — the biofeedback pattern
 
 The primary third-party integration pattern: your software produces a feedback value and the lens tracks it continuously — a **wearable screen dimmer**. Anywhere a protocol would dim/brighten the training display (out of condition → dim, in condition → clear), map that same value to lens duty instead; threshold-style binary reward and proportional analog mappings both reduce to this one write loop (worked example: `python-SDK/examples/screen_dimmer.py`).
 
-- **Primary method:** stream `[0xA5, duty]` (duty 0–100) at **~10–12 Hz** — the production dashboard uses 12 Hz.
+- **Primary method:** stream `[0xA5, duty]` (duty 0–100) toward a **30–50 Hz target** with coalescing on, so the effective rate self-limits to your data rate (full rate story in the note below).
 - **Decimate** your source signal (e.g. a 256 Hz EEG index) down to that rate; map 0..1 → 0..100.
 - Three hardening rules (production-proven):
   1. **Coalesce** — skip the write if the duty is unchanged.
   2. **Never overlap writes** — if one is in flight, drop the frame (the next catches up). See the serialization rule in [§4.3](#43-control-characteristic-0xff01--command-opcodes).
-  3. **Keep exactly one write in flight** — `0xFF01` is **write-with-response only** on current firmware ([§4.2](#42-service-0x00ff--characteristic-map); only OTA `0xFF02` exposes write-no-response), and the with-response round-trip is exactly why the one-write-in-flight rule matters at 12 Hz. If you add a property guard like the production dashboard's (`ch.properties?.writeWithoutResponse` → without-response, else with-response), write-without-response will be used automatically if a future firmware adds the property.
+  3. **Keep exactly one write in flight** — `0xFF01` is **write-with-response only** on current firmware ([§4.2](#42-service-0x00ff--characteristic-map); only OTA `0xFF02` exposes write-no-response), and the with-response round-trip is exactly why the one-write-in-flight rule doubles as your rate limiter — it paces the stream to whatever the link sustains, so a high target rate is safe. If you add a property guard like the production dashboard's (`ch.properties?.writeWithoutResponse` → without-response, else with-response), write-without-response will be used automatically if a future firmware adds the property.
 - The 1-byte legacy opacity write (0–255, [§4.3](#43-control-characteristic-0xff01--command-opcodes)) is an equivalent alternative under the same cadence rules.
-- **Smoothing the stream (fw ≥ 4.15.7):** write `[0xA0, τ]` once (persisted) and the device glides between your streamed targets with an EMA of time constant τ×10 ms — steps from a 10–12 Hz stream, RF retransmit gaps, and rate drops all render as smooth motion. Rule of thumb: τ ≈ 1–2× your write period (12 Hz → arg 8–16 ≈ 80–160 ms). Pair with `[0xA1, slew]` if you also want a hard cap on how fast the lens may move ([§4.3](#43-control-characteristic-0xff01--command-opcodes)). Both are ignored by older firmware, so send them unconditionally.
+- **Smoothing the stream — the recommended way to get smooth real-time feedback (fw ≥ 4.15.8 continuous / ≥ 4.15.9 full-resolution):** a live feedback value streamed at ~20–30 Hz is inherently **stepped** (each write is a discrete jump), and a noisy signal makes the lens visibly **jitter**. Write `[0xA0, τ]` **once** (persisted; send at connect) and the device applies an on-device EMA of time constant τ×10 ms so the lens **glides between your writes** — it bridges the inter-write gaps into continuous motion (no visible stepping) **and** absorbs per-sample noise without you filtering client-side. This is exactly what you want for real-time operant conditioning: smooth lens motion off a live, noisy signal without over-sending. Rule of thumb: **τ ≈ 1–2× your write period** (a 30 Hz stream → ~33 ms → arg 3–6; **arg 8 ≈ 80 ms** is a good general-purpose value). Optionally pair with `[0xA1, slew]` as a hard safety cap on how fast the lens may move ([§4.3](#43-control-characteristic-0xff01--command-opcodes)). `0xA0` / `0xA1` affect **commanded static only** (`0xA5` + the 1-byte opacity write), never strobe/breathe. Both are ignored by older firmware, so send them unconditionally; on fw ≥ 4.15.11 an accepted `0xA0`/`0xA1` write is echoed as a `0xF1` confirmation frame ([§4.3](#43-control-characteristic-0xff01--command-opcodes)).
+
+> ### How fast can you actually write? (the rate story)
+>
+> The firmware is **never** the bottleneck: it applies each commanded static duty on its 10 ms tick (**100 Hz internally, no command throttling**). The **BLE link** is the limit, and it depends on the negotiated connection parameters:
+> - The glasses **request** a 20–30 ms interval with slave latency 1. A host that accepts those defaults sustains only **~8–11 writes/sec** (measured: real glasses, fw 4.16.2, Windows laptop).
+> - A host that **requests throughput-optimized / low-latency connection parameters** (e.g. WinRT `RequestPreferredConnectionParameters(ThroughputOptimized)`, held for the session) reaches **~20 writes/sec sustained** (measured: median 31 ms/write, 20.8/sec).
+> - The **hard ceiling** is the connection-event rate (~33–50/sec at a 20–30 ms interval). Reaching the full **30–50 Hz** band additionally needs firmware **write-without-response on `0xFF01`** — planned, not yet shipped (`0xFF01` is write-with-response only today).
+>
+> **Recommended: set 30–50 Hz as a configurable target with coalescing on**, so the effective rate self-limits to your data rate. Since feedback sources typically produce ≤ 16–30 new values/sec, coalesced writes rarely hit the ceiling anyway. Per-update latency is ~20–60 ms BLE transport + < 100 ms lens switch.
+>
+> **Why not 12 or 20 Hz?** The old "**12 Hz**" figure was only the on-board **breathe pacer** cadence (the reference app's paced-breathing update rate), never a lens-control limit; the old "**20 Hz ceiling**" was a stale, overly-conservative doc figure with **no basis in the protocol**. Neither is a real cap — target 30–50 Hz, coalesce, and keep exactly one write in flight.
 
 Language-neutral wire sequence (worked examples in the [quickstart](#quickstart--make-the-lens-respond-to-your-signal)):
 
@@ -1164,24 +1249,24 @@ connect  →  [0xA4, 0x3C]  (60-min session guard)  →  loop: [0xA5, duty]
 
 > ### Reward-timing note — proportional vs. discrete (operant conditioning)
 >
-> The ~12 Hz cadence above is a **smoothing rate for a continuously-varying dimmer**, not a reinforcement-latency floor. Two distinct cases:
-> - **Proportional feedback** (tint tracks a signal): 12 Hz (~83 ms granularity) is far below the upstream EEG analysis window (typically 250 ms – 1 s+) that dominates the loop, so it is not the limiting term.
+> The streaming cadence above is a **smoothing rate for a continuously-varying dimmer**, not a reinforcement-latency floor. Two distinct cases:
+> - **Proportional feedback** (tint tracks a signal): even a 30 Hz stream (~33 ms granularity) is far below the upstream EEG analysis window (typically 250 ms – 1 s+) that dominates the loop, so the streaming rate is not the limiting term.
 > - **Discrete reward** (reinforce the instant a contingency is met): do **not** wait for the next tick — send the `[0xA5, duty]` write immediately. By default `0xA5` applies on-device with **no smoothing** — the breathe slew limiter is `LED_MODE_BREATHE` only — so the tint change is immediate. (Exception: if you have enabled the optional `0xA0` lens smoothing or `0xA1` slew cap on fw ≥ 4.15.7, those **do** apply to static writes and will stretch the transition — leave them off for minimum-latency discrete rewards.) The lens cell then switches in **Ton 2.5–40 ms / Toff 2.5–50 ms** (< 100 ms only when cold). Reward-delivery latency is ~20–60 ms transport + ~40–50 ms lens switch — bounded by your signal processing, not the streaming rate.
 >
 > The SDK `FeedbackStream` exposes this split directly: `feed()` / `feed_reward()` for the proportional stream, `reward_event(duty, hold_ms)` for an immediate, tick-bypassing discrete reward that preempts the stream (waiting at most one in-flight write).
 
 > **On connect** the lens is already running a standalone program until your first write takes over — normally Breathe at the **NVS-persisted** `0xB1` rate (factory default 6 BPM; a previous client's setting survives, [§4.3](#43-control-characteristic-0xff01--command-opcodes)), or a strobe program if a magnet tap already cycled it ([§4.1.1](#411-standalone-programs--magnet-gestures)). Don't treat "6 BPM breathe" as a connect-time invariant.
 >
-> **`0xA5` and `0xA2` write the SAME firmware variable** (`brightness`): `0xA5` = enter static mode + set the level (not persisted); `0xA2` = set the same value AND persist it. There is **no** separate ceiling clamping `0xA5`. Side effect: the last streamed `0xA5` value becomes the breathe **depth** if you later switch to breathe mode without re-sending `0xA2`.
+> **`0xA5` vs `0xA2` — decoupled in fw 4.16.2.** On **fw ≥ 4.16.2** they are cleanly separated: `0xA5` is a static-duty write that goes through `lens_apply_static(duty)` and does **NOT** touch `brightness` or any other program, while `0xA2` **solely** owns the persistent `brightness` (the max-tint that multiplies breathe/strobe/coherence depth). Stream `0xA5` for real-time dimming freely — it no longer disturbs your breathe depth or leaves other programs clear. (Boot also self-heals a persisted `brightness` of 0.) On **fw ≤ 4.16.1** the two shared one `brightness` variable: `0xA5` set it without persisting and `0xA2` set + persisted it, so the last streamed `0xA5` value became the breathe **depth**, and streaming static dimming to 0 left `brightness = 0` — rendering all *other* programs clear until you re-sent `0xA2`.
 
 #### 4.6.2 Command the renderer — don't stream PWM
 
 There are two ways to make the lens "breathe" (fade clear → dark → clear). (This is about *periodic* waveforms — for an aperiodic feedback signal, streaming is the right tool: [§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern).)
 
-- **❌ Stream per-tick PWM.** Compute the waveform value every frame and write it as a static duty (`0xA5`, or the 1-byte opacity write) at ~12 Hz. Don't: it's a continuous write stream (BLE air-time + glasses power), and any link jitter or a dropped write shows up as a visible stutter — smoothness becomes hostage to the link.
+- **❌ Stream per-tick PWM.** Compute the waveform value every frame and write it as a static duty (`0xA5`, or the 1-byte opacity write). Don't: it's a continuous write stream (BLE air-time + glasses power), and any link jitter or a dropped write shows up as a visible stutter — smoothness becomes hostage to the link.
 - **✅ Command the breathe program.** Send a handful of parameter writes **once** and the glasses render the smooth **100 Hz cosine locally**. The link carries only occasional writes; the waveform is smooth regardless of BLE conditions. This is the "fade clear→dark over the inhale, dark→clear over the exhale, repeating" primitive — the firmware owns the interpolation.
 
-> There is **no one-shot "ramp A→B over T seconds" opcode.** Breathe mode *is* the timed fade, but it is **cyclic** (repeats every breath). For a steady, non-breathing tint that just tracks a slow value, use `0xA5` as a **setpoint you refresh ~1 Hz** — not a per-frame stream. For fast continuous feedback (e.g. EEG-driven opacity), stream `[0xA5, duty]` or the 1-byte opacity write per the biofeedback pattern in [§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern).
+> **A one-shot "tint X→Y over Z seconds" fade** has no single opcode, but you get it on-device by pairing the `0xA1` slew cap with one `0xA5` write, or client-side by stepping `0xA5` — see [§4.6.8](#468-tint-x--y-over-z-seconds--a-timed-fade). Breathe mode is a timed fade too, but it is **cyclic** (repeats every breath). For a steady, non-breathing tint that just tracks a slow value, use `0xA5` as a **setpoint you refresh ~1 Hz** — not a per-frame stream. For fast continuous feedback (e.g. EEG-driven opacity), stream `[0xA5, duty]` or the 1-byte opacity write per the biofeedback pattern in [§4.6.1](#461-continuous-opacity-feedback--the-biofeedback-pattern).
 
 #### 4.6.3 The breathe op set
 
@@ -1330,6 +1415,38 @@ async function setStrobeFreqHz(chCtrl, hz) {
 #### 4.6.7 Backward compatibility & version
 
 `0xBA` is **ignored by firmware < 4.15.5** (unknown opcode → silent no-op), so you can always send it; on old firmware the lens stays on the integer-`0xB1` rate path (rate-matched, not phase-locked) — and on current firmware the lens likewise falls back to that same integer path **2 cycles after the last `0xBA`** ([§4.6.5](#465-phase-sync--the-one-rule-write-only-at-the-breath-boundary)), which is why `0xB1` must always accompany `0xBA`. **The Edge does not expose a Device Information Service** and has no version characteristic — the only version readback is the informal `0xF1` hello string emitted on `0xFF03` subscribe (`Narbis fw v…`, fw ≥ 4.12.1; [§4.4.2](#442-log-string-0xf1--variable)); on older firmware there is no readback at all, so send `0xBA` unconditionally (it's safe) rather than gating on version. (The *earclip* does expose DIS `0x180A` / `0x2A26` — [§3.4](#34-device-information-service--0x180a) — but that is the earclip's version, not the Edge's.) The full feature/version matrix is in [§9.3](#93-firmware-featureversion-matrix).
+
+#### 4.6.8 Tint X → Y over Z seconds — a timed fade
+
+A fixed fade from one tint to another over a set duration (e.g. clear → dark over 2 s). Two ways to do it; pick by whether the firmware owns the ramp or you do.
+
+**1. Firmware slew ramp — one write, on-device (recommended for a fixed fade; fw ≥ 4.15.7).** Set the slew cap `0xA1` so the firmware ramps commanded static at a constant rate, then write the target **once** with `0xA5`. To move `Δduty` percent over `Z` seconds:
+
+```
+slew (%/100 ms) = round(Δduty / (Z × 10))     # clamp 1–100; 0 = unlimited/instant
+```
+
+*Worked example* — fade fully clear → dark (Δ = 100) over 2 s: `slew = 100 / (2 × 10) = 5`, so send `[0xA1, 5]` then `[0xA5, 100]` and the lens ramps to dark over ~2 s **on-device**, no streaming. Send `[0xA1, 0]` afterward if you want later writes to snap again.
+
+```python
+async def fade_over(client, from_duty: int, to_duty: int, seconds: float):
+    delta = abs(to_duty - from_duty)
+    slew  = max(1, min(100, round(delta / (seconds * 10))))   # %/100 ms
+    await send_cmd(client, 0xA1, slew)      # set the ramp rate
+    await send_cmd(client, 0xA5, to_duty)   # one write; firmware ramps there over ~seconds
+    # later, to make writes snap again: await send_cmd(client, 0xA1, 0)
+```
+
+The slew is a **fixed rate**, so for an exact duration regardless of distance, recompute `slew` from the actual `Δ` each fade. (`0xA0` smoothing, if set, rides on top of the slew — leave it off if you want the ramp duration to be exactly `Z`.)
+
+**2. Client-side interpolation — full curve control, any firmware.** Step `0xA5` from X to Y over Z seconds at your write rate — this lets you shape the curve (linear, ease-in/out, …):
+
+```
+steps    = Z × rate
+duty_i   = round(X + (Y − X) · i / steps)     # i = 0 … steps
+```
+
+Write each `duty_i` at `1/rate` spacing, coalesced (skip unchanged values). A linear fade this way is identical in result to method 1; interpolation earns its keep when you want a non-linear curve.
 
 ### 4.7 The Edge as relay
 
@@ -1932,7 +2049,7 @@ EARCLIP — Standard SIG services
     Firmware Revision                 0x2A26   read
     Serial Number                     0x2A25   read
 
-EDGE — Single custom service
+EDGE — Custom service
   Service                             0x00FF
     Control                           0xFF01   read + write
                                                opcodes 0xA2..0xE0 (sparse)
@@ -1945,6 +2062,10 @@ EDGE — Single custom service
                                                OTA codes 0x01..0x08
     PPG Stream                        0xFF04   read + notify
                                                (not emitted on current fw — §4.5)
+
+EDGE — Standard SIG services (fw ≥ 4.16.1, V1.2+ hardware only)
+  Battery Service                     0x180F
+    Battery Level                     0x2A19   read + notify   (u8 0–100; reads 0 while unknown — §4.4.12)
 
 OTA — Shared between Edge and Earclip (same UUIDs)
   Service                             0x00FF
@@ -1981,6 +2102,10 @@ OTA — Shared between Edge and Earclip (same UUIDs)
 | `0xA0`/`0xA1`/`0xA3` lens-config knobs (smoothing / slew cap / disconnect fail-clear) | 4.15.7 | ignored (unknown opcodes) — lens snaps, no slew cap, disconnect freezes at last output |
 | `0xA0` smoothing converges under a continuous stream | 4.15.8 | 4.15.7 glides but stalls ~2–4 % short of each streamed target (EMA re-seeded per write), clipping extremes |
 | `0xA0` smoothed output at full PWM resolution (no ~1 %-duty stepping) | 4.15.9 | ≤ 4.15.8 requantizes the smoothed glide to the 101-level integer-duty grid → visible stepping even at max τ |
+| `0xA0`/`0xA1`/`0xA3` lens-config write confirmation (`0xF1` frame on `0xFF03`) | 4.15.11 | write applied silently — no confirmation frame (still no config readback on any version) |
+| Glasses battery over BLE — `0x180F` / `0x2A19`, `0xFB` status frame, `0xC7` poll | 4.16.1 (V1.2+ hardware) | not exposed — no glasses battery over BLE |
+| Program-1 startup pulse silenced (only programs 2+ pulse on change) | 4.16.1 | program 1 also pulsed once on change |
+| `0xA5` clean static write — does not touch `brightness` / other programs | 4.16.2 | `0xA5` shared the `brightness` variable with `0xA2`; static dimming to 0 left other programs clear |
 | `0xBA` breathe-sync | 4.15.5 | ignored (unknown opcode) |
 | `0xB0 0x01` breathe+strobe | 4.15.6 | plain breathe |
 | duty→opacity floor remap ([§4.6.4](#464-lens-opacity-is-not-linear--the-dutyopacity-floor-fw--4154)) | 4.15.4 | no floor remap |

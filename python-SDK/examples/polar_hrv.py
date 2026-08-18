@@ -303,7 +303,8 @@ class SimpleHRFeedback:
         if not self.glasses:
             return
 
-        # Polar notifies at ~1 Hz, well under the <= 20 Hz opacity-write cap
+        # Polar notifies at ~1 Hz, so opacity writes are naturally sparse --
+        # no fixed rate ceiling to worry about here.
         # Map HR to opacity
         # Higher HR = darker (to encourage relaxation)
         normalized = (hr - self.hr_min) / (self.hr_max - self.hr_min)

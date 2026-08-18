@@ -34,7 +34,13 @@ import math
 import time
 from edge_glasses import Glasses
 
-UPDATE_HZ = 12          # production-proven write rate (~20 Hz is the ceiling)
+# Real-time lens write rate. Target 30-50 Hz for live feedback -- there is no
+# 20 Hz protocol ceiling (that was a stale doc figure). The old "12 Hz" was the
+# on-board breathe *pacer* cadence, NOT a lens-control limit; don't confuse the
+# two. Coalescing + one-write-in-flight self-limit the effective rate to your
+# data rate, so a high target is safe. (For on-device smoothing between writes,
+# see glasses.set_lens_smoothing() instead of the client-side EWMA below.)
+UPDATE_HZ = 30
 SESSION_MINUTES = 60    # session guard: block auto-sleep for the full hour
 
 
@@ -93,7 +99,7 @@ async def demo_signal(dimmer: LensDimmer) -> None:
         value = 0.5 + 0.5 * math.sin(2 * math.pi * t / 20.0)
         dimmer.feed(value)
         print(f"\r  feedback={value:.2f}  lens={dimmer._last_sent:>3}%  ", end="")
-        await asyncio.sleep(0.05)   # feed() can run at any rate; writes stay at 12 Hz
+        await asyncio.sleep(0.05)   # feed() can run at any rate; writes decimate to UPDATE_HZ
 
 
 async def main() -> None:
