@@ -95,15 +95,45 @@ blocks the device chooser otherwise.
 
 ## Standalone Programs (no app needed)
 
-The glasses also run sensor-free on-board programs, cycled by a short magnet tap
-(0.15–4 s) on the temple:
+What the glasses do on their own. **This changed substantially in firmware 4.17.0.**
+
+**fw ≥ 4.17.0** — one program: breathe at the persisted rate (6 BPM by default).
+Opening the temple arm starts it; **a short tap does nothing.** The old
+breathe+strobe and strobe programs are gone from the default cycle, because
+folding an arm and re-opening it used to drop wearers into a 10 Hz strobe they
+never asked for.
+
+The tap cycle still exists, over a programmable table of up to 5 slots, off
+until you enable it:
+
+```typescript
+import { StandaloneMode } from 'edge-glasses';
+
+await glasses.setStandalonePrograms([
+  { mode: StandaloneMode.Breathe },                        // inherits everything
+  { mode: StandaloneMode.BreatheStrobe, bpm: 5 },
+  { mode: StandaloneMode.Strobe, strobeHz: 10 },
+]);
+
+const cfg = await glasses.getStandaloneConfig();           // null on fw < 4.17.0
+if (cfg?.cycleEnabled) console.log(`${cfg.count} programs, running #${cfg.active + 1}`);
+```
+
+Omitting a slot field means **inherit the value already persisted on the
+glasses**, so `{ mode: StandaloneMode.Breathe }` is exactly the factory program.
+`setStandaloneCount(1)` turns the cycle back off without losing the table.
+
+> Enabling the cycle re-arms tap-to-switch, so a stray tap can take the lens away
+> from your app mid-session. Leave it off for app-driven sessions.
+
+**fw ≤ 4.16.3** — a short magnet tap (0.15–4 s) cycles three fixed programs:
 
 1. **BREATHE** — 6 BPM sine, lens tint follows the waveform (boot default)
 2. **BREATHE+STROBE** — 10 Hz strobe with dark-phase duty modulated by the breathing waveform
 3. **STROBE** — plain 10 Hz strobe
 
-A long magnet close (≥ 5 s) puts the glasses into deep sleep. On program change the
-lens gives N slow fade-dark pulses to indicate the program number.
+A long magnet close (≥ 5 s) puts the glasses into deep sleep, on every version. On
+program change the lens gives N slow fade-dark pulses to indicate the program number.
 
 ## Usage
 
@@ -344,7 +374,11 @@ function GlassesControl() {
 | Method | Description |
 |--------|-------------|
 | `sendCommand(opcode, payload?)` | Raw opcode write (padded to ≥ 2 bytes) |
-| `factoryReset()` | Restore persisted settings to factory defaults |
+| `setStandaloneCount(count)` | fw ≥ 4.17.0. Magnet-tap cycle: 0/1 = off (default), 2–5 = cycle N slots |
+| `setStandaloneProgram(slot, program)` | fw ≥ 4.17.0. Write one standalone slot; omitted fields inherit the persisted globals |
+| `setStandalonePrograms(programs, enableCycle?)` | fw ≥ 4.17.0. Writes all slots **then** the count — the safe order |
+| `getStandaloneConfig(timeoutMs?)` | fw ≥ 4.17.0. Reads the config back; `null` on older firmware. The only readback the Edge offers |
+| `factoryReset()` | Restore persisted settings to factory defaults (fw ≥ 4.17.0: also wipes the standalone slot table) |
 
 ### Legacy: on-board coherence pipeline
 

@@ -7,13 +7,21 @@
  * firmware's breathe / static / strobe renderer.
  *
  * @module edge-glasses
- * @version 2.4.0
+ * @version 2.5.0
  */
 
 // BLE UUIDs
 const SERVICE_UUID = 0x00ff;
 const CHAR_UUID = 0xff01;
 const DEVICE_NAME = 'Narbis_Edge';
+
+// Status notification characteristic - type-tagged frames, byte 0 = type.
+// Used here only for the 0xFC standalone-config readback (fw >= 4.17.0).
+const STATUS_CHAR_UUID = 0xff03;
+
+/** Firmware's standalone slot limit. Prefer the device's own `max` from
+ *  getStandaloneConfig() when rendering a UI. */
+export const STANDALONE_MAX_PROGRAMS = 5;
 
 // Standard BLE Battery Service (firmware >= 4.16.1 on V1.2+ hardware)
 const BATTERY_SERVICE_UUID = 0x180f;
@@ -60,6 +68,85 @@ export interface BreatheOptions {
 export interface ScanResult {
   device: BluetoothDevice;
   name: string;
+}
+
+/**
+ * What a standalone program slot renders (opcode 0xBD, byte `mode`).
+ *
+ * Standalone programs are what the glasses run with no app connected,
+ * selected by the magnet / temple-arm gesture. Firmware >= 4.17.0 only.
+ */
+export const StandaloneMode = {
+  Breathe: 0,
+  BreatheStrobe: 1,
+  Strobe: 2,
+  /** Fixed tint at the slot's `brightness` */
+  Static: 3,
+} as const;
+export type StandaloneMode = (typeof StandaloneMode)[keyof typeof StandaloneMode];
+
+/**
+ * One standalone program slot (firmware >= 4.17.0).
+ *
+ * Every field except `mode` is optional, and omitting it means **inherit the
+ * value already persisted on the glasses** (the firmware encodes that as 0).
+ * Prefer inheriting: an inheriting slot automatically tracks later
+ * setBrightness() / startBreathe() writes, while a pinned value overrides them.
+ *
+ * `{ mode: StandaloneMode.Breathe }` inherits everything - which is exactly
+ * the factory default.
+ */
+export interface StandaloneProgram {
+  mode: StandaloneMode;
+  /** 1-30; omit to inherit the persisted 0xB1 rate */
+  bpm?: number;
+  /** 10-90; omit to inherit the persisted 0xB2 ratio */
+  inhalePct?: number;
+  /** 1.0-50.0 Hz, 0.1 Hz resolution; omit to inherit the persisted 0xAB rate */
+  strobeHz?: number;
+  /** 10-90; omit to inherit the persisted 0xAC duty */
+  dutyPct?: number;
+  /** 1-100; omit to inherit the persisted 0xA2 brightness. For Static, the tint */
+  brightness?: number;
+}
+
+/** Whole standalone configuration, as read back by getStandaloneConfig(). */
+export interface StandaloneConfig {
+  /** Slots the magnet tap cycles. 1 = cycle off (one program) */
+  count: number;
+  /** Slots this firmware supports - read it, don't hardcode */
+  max: number;
+  /** 0-based index of the slot running right now */
+  active: number;
+  /** True when a magnet tap actually changes program (count > 1) */
+  cycleEnabled: boolean;
+  slots: StandaloneProgram[];
+}
+
+/** Pack the 7 payload bytes that follow [0xBD][slot]. */
+function packStandaloneSlot(p: StandaloneProgram): number[] {
+  const dhz = p.strobeHz === undefined ? 0 : clamp(p.strobeHz * 10, 10, 500);
+  return [
+    p.mode & 0xff,
+    p.bpm === undefined ? 0 : clamp(p.bpm, 1, 30),
+    p.inhalePct === undefined ? 0 : clamp(p.inhalePct, 10, 90),
+    dhz & 0xff,
+    (dhz >> 8) & 0xff,
+    p.dutyPct === undefined ? 0 : clamp(p.dutyPct, 10, 90),
+    p.brightness === undefined ? 0 : clamp(p.brightness, 1, 100),
+  ];
+}
+
+/** Unpack one 8-byte slot record from a 0xFC frame (byte 7 is reserved). */
+function unpackStandaloneSlot(view: DataView, offset: number): StandaloneProgram {
+  const dhz = view.getUint16(offset + 3, true);
+  const out: StandaloneProgram = { mode: view.getUint8(offset) as StandaloneMode };
+  if (view.getUint8(offset + 1)) out.bpm = view.getUint8(offset + 1);
+  if (view.getUint8(offset + 2)) out.inhalePct = view.getUint8(offset + 2);
+  if (dhz) out.strobeHz = dhz / 10;
+  if (view.getUint8(offset + 5)) out.dutyPct = view.getUint8(offset + 5);
+  if (view.getUint8(offset + 6)) out.brightness = view.getUint8(offset + 6);
+  return out;
 }
 
 /** Clamp helper: integer clamp into [min, max]. */
@@ -554,11 +641,154 @@ export class Glasses {
     await this.send([0xA7, 0x00]);
   }
 
-  /**
+   /**
    * Restore all persisted settings to factory defaults (opcode 0xBF).
+   *
+   * On firmware >= 4.17.0 this also wipes the standalone program table and
+   * disables the magnet-tap cycle, returning the glasses to a single breathe
+   * program at 6 BPM.
    */
   async factoryReset(): Promise<void> {
     await this.send([0xBF, 0x00]);
+  }
+
+  // -------------------------------------------------------------------------
+  // Standalone programs (firmware >= 4.17.0)
+  // -------------------------------------------------------------------------
+  // What the glasses run with NO app connected, selected by the magnet /
+  // temple-arm gesture.
+  //
+  // Out of the box there is exactly one standalone program - breathe at the
+  // persisted rate - and a short tap does nothing. Programming more than one
+  // slot and enabling the cycle re-arms tap-to-switch, which also means a
+  // stray tap can take the lens away from your app mid-session. Leave the
+  // cycle off for app-driven sessions.
+
+  /**
+   * Enable or disable the magnet-tap program cycle (opcode 0xBC).
+   *
+   * Persisted to NVS. Firmware < 4.17.0 ignores this silently.
+   * Write your slots BEFORE raising the count - or use
+   * {@link setStandalonePrograms}, which orders it for you.
+   *
+   * @param count 0 or 1 disables the cycle (one program, tap does nothing -
+   *   the default on every unit). 2-5 makes a short tap cycle that many slots.
+   */
+  async setStandaloneCount(count: number): Promise<void> {
+    await this.send([0xBC, clamp(count, 0, 255)]);
+  }
+
+  /**
+   * Write one standalone program slot (opcode 0xBD).
+   *
+   * Persisted to NVS immediately. Writing the slot that is currently running
+   * re-applies it, so this doubles as a live preview. This does NOT enable
+   * the tap cycle - that is {@link setStandaloneCount}.
+   *
+   * @param slot 0-based slot index (0 is the program every power-on lands on)
+   * @param program Slot definition; omitted fields inherit the persisted globals
+   */
+  async setStandaloneProgram(slot: number, program: StandaloneProgram): Promise<void> {
+    // 9 B total: [0xBD][slot] + 7 payload bytes. Note the asymmetry with the
+    // 0xFC readback, whose slot records are 8 B (trailing reserved byte) -
+    // the write form has no reserved byte.
+    const packet = [0xBD, clamp(slot, 0, STANDALONE_MAX_PROGRAMS - 1),
+                    ...packStandaloneSlot(program)];
+    await this.send(packet);
+  }
+
+  /**
+   * Write a whole standalone program set and enable the tap cycle.
+   *
+   * Writes every slot first, then the count - the correct order, because
+   * raising the count first would briefly let a tap land on slots that have
+   * not been written yet.
+   *
+   * @param programs 1-5 slot definitions, in the order the tap cycles them
+   * @param enableCycle When true (default) a tap cycles `programs.length`
+   *   programs. Pass false to store the set but leave the tap inert (count 1).
+   *
+   * @example
+   * ```typescript
+   * await glasses.setStandalonePrograms([
+   *   { mode: StandaloneMode.Breathe },                              // inherits all
+   *   { mode: StandaloneMode.BreatheStrobe, bpm: 5 },
+   *   { mode: StandaloneMode.Strobe, strobeHz: 10 },
+   * ]);
+   * ```
+   */
+  async setStandalonePrograms(
+    programs: StandaloneProgram[],
+    enableCycle = true,
+  ): Promise<void> {
+    if (programs.length === 0) {
+      throw new Error('need at least one standalone program');
+    }
+    if (programs.length > STANDALONE_MAX_PROGRAMS) {
+      throw new Error(
+        `at most ${STANDALONE_MAX_PROGRAMS} standalone programs (got ${programs.length})`,
+      );
+    }
+    for (let i = 0; i < programs.length; i++) {
+      await this.setStandaloneProgram(i, programs[i]);
+    }
+    await this.setStandaloneCount(enableCycle ? programs.length : 1);
+  }
+
+  /**
+   * Read the standalone program configuration back off the device (0xBE).
+   *
+   * The only configuration readback the glasses offer - every other persisted
+   * setting is write-only, so this is the one case where a UI can show the
+   * device's real state instead of a mirrored "last known" value.
+   *
+   * @param timeoutMs How long to wait for the 0xFC reply (default 2000)
+   * @returns The configuration, or null if no reply arrived - which on this
+   *   protocol means firmware older than 4.17.0 (unknown opcodes are dropped
+   *   silently, there is no NACK). Treat null as "this firmware has no
+   *   standalone slot table," not as an error.
+   */
+  async getStandaloneConfig(timeoutMs = 2000): Promise<StandaloneConfig | null> {
+    if (!this.isConnected || !this.server) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+
+    const service = await this.server.getPrimaryService(SERVICE_UUID);
+    const status = await service.getCharacteristic(STATUS_CHAR_UUID);
+
+    let onChange: ((e: Event) => void) | null = null;
+    try {
+      const frame = await new Promise<DataView | null>((resolve) => {
+        const timer = setTimeout(() => resolve(null), timeoutMs);
+        onChange = (event: Event) => {
+          const value = (event.target as BluetoothRemoteGATTCharacteristic).value;
+          if (value && value.byteLength >= 4 && value.getUint8(0) === 0xfc) {
+            clearTimeout(timer);
+            resolve(value);
+          }
+        };
+        status.addEventListener('characteristicvaluechanged', onChange);
+        status.startNotifications()
+          .then(() => this.send([0xBE, 0x00]))
+          .catch(() => { clearTimeout(timer); resolve(null); });
+      });
+
+      if (!frame) return null;    // fw < 4.17.0 - opcode silently dropped
+
+      const count = frame.getUint8(1);
+      const max = frame.getUint8(2);
+      const active = frame.getUint8(3);
+      const slots: StandaloneProgram[] = [];
+      for (let i = 0; i < max; i++) {
+        const offset = 4 + i * 8;
+        if (frame.byteLength < offset + 8) break;   // short frame - stop, don't guess
+        slots.push(unpackStandaloneSlot(frame, offset));
+      }
+      return { count, max, active, cycleEnabled: count > 1, slots };
+    } finally {
+      if (onChange) status.removeEventListener('characteristicvaluechanged', onChange);
+      try { await status.stopNotifications(); } catch { /* link already gone */ }
+    }
   }
 
   // -------------------------------------------------------------------------

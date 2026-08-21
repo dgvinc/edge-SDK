@@ -1,6 +1,6 @@
 # EDGE Glasses BLE API Reference
 
-**Firmware Version:** 4.16.3 (current) — per-feature minimum versions are noted inline (e.g. 4.15.9+ for smooth streamed smoothing, 4.16.1+ for battery, 4.16.3+ for write-without-response on 0xFF01)
+**Firmware Version:** 4.17.0 (current) — per-feature minimum versions are noted inline (e.g. 4.15.9+ for smooth streamed smoothing, 4.16.1+ for battery, 4.16.3+ for write-without-response on 0xFF01, 4.17.0+ for the standalone program table)
 **Last Updated:** August 2026
 
 This is the **wire / opcode reference** for the Narbis Edge glasses: every BLE command, its bytes, ranges, and on-device behavior. You can drive the glasses directly from raw BLE with only this document.
@@ -97,7 +97,10 @@ Any single-byte write sets lens opacity directly:
 | `0xB4` | Breathe hold-bottom | 0-50 (× 100 ms) | yes | Hold at clear |
 | `0xB5` | Breathe waveform | 0 sine / 1 linear | yes | |
 | `0xBA` | Breathe sync | `[cycle_ms:u16 LE][inhale_pct:u8]` | no | Fractional-rate phase lock — see [§0xBA](#0xba--breathe-sync-fw--4155) |
-| `0xBF` | Factory reset | ignored (send `0x00`) | — | Resets all persisted settings to defaults |
+| `0xBC` | Standalone program count | 0–5 | yes | fw ≥ 4.17.0. Magnet-tap cycle: 0/1 = off (default), 2–5 = tap cycles that many slots |
+| `0xBD` | Standalone slot write | 8 B payload | yes | fw ≥ 4.17.0. `[0xBD][slot][mode][bpm][inhale][dhz:u16 LE][duty][brightness]`, 9 B on the wire; every numeric field 0 = inherit the persisted global |
+| `0xBE` | Standalone config read | `0x00` | — | fw ≥ 4.17.0. Replies with a `0xFC` frame on `0xFF03`; the only config readback the Edge offers |
+| `0xBF` | Factory reset | ignored (send `0x00`) | — | Resets all persisted settings to defaults (fw ≥ 4.17.0: including the standalone slot table + count) |
 | `0xC7` | Battery poll / probe diag | `0x00` refresh / `0x01` reprobe ADC | no | fw ≥ 4.16.1. Refreshes the battery reading (or re-runs the ADC channel probe with `0x01`); result lands on `0x180F` / the `0xFB` status frame — see [Battery](#battery-fw--4161) |
 | `0xA8`/`0xA9`/`0xAA`/`0xAD` | OTA | — | — | Firmware update flow; see the [protocol doc](../docs/bluetooth-protocol.md) |
 
@@ -291,6 +294,10 @@ Parameters marked "persisted" survive sleep and power cycles (NVS); `0xBF` resto
 | `0xAB`/`0xAC` | `set_strobe_frequency` / `set_strobe_duty` | `setStrobeFrequency` / `setStrobeDuty` |
 | `0xB0`–`0xB5` | `start_breathe(...)` | `startBreathe({...})` |
 | `0xBA` | `sync_breath(cycle_ms, inhale_pct)` | `syncBreath(cycleMs, inhalePct)` |
+| `0xBC` | `set_standalone_count()` | `setStandaloneCount()` |
+| `0xBD` | `set_standalone_program()` | `setStandaloneProgram()` |
+| `0xBC`+`0xBD` | `set_standalone_programs()` | `setStandalonePrograms()` |
+| `0xBE` → `0xFC` | `get_standalone_config()` | `getStandaloneConfig()` |
 | `0xBF` | `factory_reset()` | `factoryReset()` |
 | `0xC7` / `0x2A19` | `get_battery()` → 0-100 or `None` | `getBattery()` → 0-100 or `null` |
 | (WNR fast path) | `supports_fast_write` / `_stream_static()` | `supportsFastWrite` / `streamStatic()` |

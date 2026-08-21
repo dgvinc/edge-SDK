@@ -97,8 +97,39 @@ asyncio.run(main())
 
 ## Standalone Programs (no app needed)
 
-The glasses run sensor-free programs on their own, cycled by a short magnet tap
-(0.15-4 s) on the temple:
+What the glasses do on their own. **This changed substantially in firmware 4.17.0.**
+
+**fw >= 4.17.0** — one program: breathe at the persisted rate (6 BPM by default).
+Opening the temple arm starts it; **a short tap does nothing.** The old
+breathe+strobe and strobe programs are gone from the default cycle, because
+folding an arm and re-opening it used to drop wearers into a 10 Hz strobe they
+never asked for.
+
+The tap cycle still exists, over a programmable table of up to 5 slots, off until
+you enable it:
+
+```python
+from edge_glasses import StandaloneProgram, StandaloneMode
+
+await glasses.set_standalone_programs([
+    StandaloneProgram(),                                       # breathe, inherits everything
+    StandaloneProgram(StandaloneMode.BREATHE_STROBE, bpm=5),
+    StandaloneProgram(StandaloneMode.STROBE, strobe_hz=10.0),
+])
+
+cfg = await glasses.get_standalone_config()                    # None on fw < 4.17.0
+if cfg and cfg.cycle_enabled:
+    print(f"{cfg.count} programs, running #{cfg.active + 1}")
+```
+
+A `None` slot field means **inherit the value already persisted on the glasses**,
+so a bare `StandaloneProgram()` is exactly the factory program.
+`set_standalone_count(1)` turns the cycle back off without losing the table.
+
+> Enabling the cycle re-arms tap-to-switch, so a stray tap can take the lens away
+> from your app mid-session. Leave it off for app-driven sessions.
+
+**fw <= 4.16.3** — a short magnet tap (0.15-4 s) cycles three fixed programs:
 
 | Program | Behavior |
 |---------|----------|
@@ -106,8 +137,8 @@ The glasses run sensor-free programs on their own, cycled by a short magnet tap
 | 2 — BREATHE+STROBE | 10 Hz strobe, dark-phase duty modulated by the breathing waveform |
 | 3 — STROBE | plain 10 Hz strobe |
 
-A long magnet close (≥ 5 s) is deep sleep. On a program change the lens shows N slow
-fade-dark pulses as an indicator.
+A long magnet close (>= 5 s) is deep sleep, on every version. On a program change
+the lens shows N slow fade-dark pulses as an indicator.
 
 ## Integrations
 

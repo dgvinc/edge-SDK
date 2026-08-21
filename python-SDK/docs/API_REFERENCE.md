@@ -163,7 +163,11 @@ Two ways:
 | Method | Wire bytes | Notes |
 |--------|-----------|-------|
 | `sleep()` | `[0xA7, 0x00]` | Deep sleep now; arg ignored (padded) |
-| `factory_reset()` | `[0xBF, 0x00]` | Reset NVS settings; arg ignored (padded) |
+| `set_standalone_count(count)` | `[0xBC, count]` | fw ≥ 4.17.0. Magnet-tap cycle: 0/1 = off (default), 2–5 = cycle N slots |
+| `set_standalone_program(slot, program)` | `[0xBD, slot, …]` | fw ≥ 4.17.0. Write one slot (9 B); `None` fields inherit the persisted globals |
+| `set_standalone_programs(programs, enable_cycle=True)` | `0xBD` × N then `0xBC` | fw ≥ 4.17.0. Writes slots **then** the count — the safe order |
+| `get_standalone_config(timeout=2.0)` | `[0xBE, 0x00]` → `0xFC` | fw ≥ 4.17.0. Returns `None` on older firmware (no reply). The only readback the Edge offers |
+| `factory_reset()` | `[0xBF, 0x00]` | Reset NVS settings; arg ignored (padded). fw ≥ 4.17.0: also wipes the standalone slot table |
 | `send_command(opcode, payload=None)` | `[opcode, ...payload]` padded to ≥ 2 B | Low-level escape hatch |
 
 ### Battery (firmware ≥ 4.16.1, V1.2+ hardware)
@@ -236,6 +240,9 @@ configure the renderer and set the auto-sleep duration.
 | `0xB4` | Breathe hold-bottom | 0-50 (×100 ms) | yes | `start_breathe(hold_bottom_ms=...)` |
 | `0xB5` | Breathe waveform | 0 sine / 1 linear | yes | `start_breathe(waveform=...)` |
 | `0xBA` | Breathe sync | `[cycle_ms:u16 LE][inhale_pct:u8]` | no | `sync_breath` |
+| `0xBC` | Standalone program count | 0–5 | yes | `set_standalone_count` |
+| `0xBD` | Standalone slot write | 8 B payload | yes | `set_standalone_program` |
+| `0xBE` | Standalone config read | 0 | — | `get_standalone_config` |
 | `0xBF` | Factory reset | arg ignored (send 0) | — | `factory_reset` |
 | `0xC7` | Battery poll / probe diagnostics | `0x00` refresh / `0x01` reprobe ADC; fw ≥ 4.16.1 | — | not an SDK method — use `get_battery()` (0x180F) / see [protocol doc](../../docs/bluetooth-protocol.md) |
 | `0xA8`/`0xA9`/`0xAA`/`0xAD` | OTA | — | — | not an SDK method — see [protocol doc](../../docs/bluetooth-protocol.md) |
