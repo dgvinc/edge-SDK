@@ -2,11 +2,11 @@
 
 > **Audience.** Developers speaking the wire protocol directly — **Python** (via [bleak](https://github.com/hbldh/bleak)) or **JavaScript** (via Web Bluetooth) — whether you're using the edge-SDK libraries or bypassing them. Everything a client needs to talk to the **Narbis Edge** glasses and the **Narbis Earclip** over BLE is in this document.
 >
-> **Provenance.** Synced to glasses firmware **4.16.3+** and earclip firmware **config v4** — August 2026.
+> **Provenance.** Synced to glasses firmware **4.17.0+** and earclip firmware **config v4** — August 2026.
 >
 > **Scope.** Scanning, connecting, GATT discovery, command writes, notification parsing, driving the lens ([§4.6](#46-driving-the-edge-lens)), OTA firmware update, troubleshooting.
 >
-> **Architecture — read this first.** All signal processing (coherence, HRV, EEG, anything) runs **app-side**. The glasses are a **display**: your app computes its feedback signal and drives the lens by commanding the firmware's **breathe / static / strobe** renderer ([§4.6](#46-driving-the-edge-lens)). The firmware still ships a legacy on-board coherence pipeline (sensor-driven PPG programs); its opcodes remain on the wire and are documented in [§4.8](#48-legacy-on-board-coherence-pipeline-unused), but current apps do not use it. The glasses also run three sensor-free **standalone programs** cycled by a magnet tap — no app required ([§4.1.1](#411-standalone-programs--magnet-gestures)).
+> **Architecture — read this first.** All signal processing (coherence, HRV, EEG, anything) runs **app-side**. The glasses are a **display**: your app computes its feedback signal and drives the lens by commanding the firmware's **breathe / static / strobe** renderer ([§4.6](#46-driving-the-edge-lens)). The firmware still ships a legacy on-board coherence pipeline (sensor-driven PPG programs); its opcodes remain on the wire and are documented in [§4.8](#48-legacy-on-board-coherence-pipeline-unused), but current apps do not use it. The glasses also run a sensor-free **standalone program** with no app required — on fw ≥ 4.17.0 that is a single breathing program, and the magnet tap does nothing until an app enables a multi-program cycle; on older firmware a tap cycles three fixed programs ([§4.1.1](#411-standalone-programs--magnet-gestures)).
 >
 > **Pairing/bonding:** neither device requires encryption or bonding.
 >
@@ -274,7 +274,7 @@ Both devices auto-resume advertising on disconnect — reconnect with exponentia
 
 > **Edge-only quirk:** the glasses tear down their BLE stack entirely after **2 minutes** with no client connected (`BLE_IDLE_TIMEOUT_MS = 120000`) — and the teardown fully powers down the radio. The user has to wake the device (magnet tap on the temple) to start advertising again. Surface this in your UX ("tap your glasses to wake them") rather than silently retrying forever. In Python, re-**scan** after a failed reconnect rather than reusing a cached `BLEDevice` ([§7.2](#72-windows--winrt--python-bleak-gotchas)).
 >
-> ⚠️ **Instruct users to tap only after the Edge is confirmed absent from scans** (after the retry guidance in [§7.2](#72-windows--winrt--python-bleak-gotchas)). Magnet gestures stay live while a client is connected ([§4.1.1](#411-standalone-programs--magnet-gestures)), so a tap during a transient link drop — or while another client holds the connection — cycles the running program, and a ≥ 5 s hold deep-sleeps the device.
+> ⚠️ **Instruct users to tap only after the Edge is confirmed absent from scans** (after the retry guidance in [§7.2](#72-windows--winrt--python-bleak-gotchas)). Magnet gestures stay live while a client is connected ([§4.1.1](#411-standalone-programs--magnet-gestures)), so a tap during a transient link drop — or while another client holds the connection — deep-sleeps the device on a ≥ 5 s hold (every version), and on fw ≤ 4.16.3 a short tap also cycles the running program. On fw ≥ 4.17.0 a short tap is inert unless an app enabled the cycle via `0xBC`.
 
 After every reconnect:
 
@@ -775,7 +775,18 @@ The Edge advertises one custom service, **`0x00FF`**, with four characteristics 
 
 #### 4.1.1 Standalone programs & magnet gestures
 
-The glasses work without any app. A short magnet tap (0.15–4 s) on the temple cycles three sensor-free programs; on change the lens signals the new program with N slow fade-dark pulses — **except program 1, which is silent on fw ≥ 4.16.1** (only programs 2+ pulse on change; older firmware also pulsed once for program 1):
+The glasses work without any app. **What the magnet tap can reach changed substantially in fw 4.17.0** — gate any UX copy about it on the version ([§9.3](#93-firmware-featureversion-matrix)).
+
+**fw ≥ 4.17.0 — one program, and a tap does nothing by default.** Out of the box there is exactly **one** standalone program: **Breathe at the NVS-persisted `0xB1` rate** (factory default 6 BPM). Opening the temple arm powers the glasses on and starts it.
+
+- A **short tap** — closing the arm and re-opening it inside 5 s — **does nothing.** No program change, no pulse.
+- Holding the magnet closed **≥ 5 s** still deep-sleeps the device. Unchanged.
+
+Programs 2 (breathe+strobe) and 3 (strobe) are **gone from the default cycle**. Nothing standalone strobes unless an app deliberately programs it. The change exists because the old cycle was reachable by accident: folding a temple arm and re-opening it — putting the glasses down, adjusting fit — advanced the program and dropped wearers into a 10 Hz strobe they never asked for, with no labelled way back out.
+
+The firmware still supports a magnet-tap cycle, now over a **programmable table of up to 5 slots**, but it stays off until an app enables it (`0xBC`, [§4.1.3](#413-programming-the-standalone-slots-fw--4170)). With it enabled, a short tap advances slots 1…N and fires the same N-pulse indicator the old cycle used (slot 1 silent).
+
+**fw ≤ 4.16.3 — the legacy three-program cycle.** A short magnet tap (0.15–4 s) on the temple cycles three fixed sensor-free programs; on change the lens signals the new program with N slow fade-dark pulses — **except program 1, which is silent on fw ≥ 4.16.1** (only programs 2+ pulse on change; firmware before 4.16.1 also pulsed once for program 1):
 
 | Program | Behavior |
 |---|---|
@@ -783,11 +794,65 @@ The glasses work without any app. A short magnet tap (0.15–4 s) on the temple 
 | 2 — Breathe + Strobe | 10 Hz strobe, dark-phase duty modulated by the breathing waveform |
 | 3 — Strobe | Plain 10 Hz strobe |
 
-> The behaviors above are **factory defaults**, not fixed program properties. The standalone programs render from the same NVS-persisted parameters the opcodes write — breathe rate/shape (`0xB1`/`0xB2`/`0xB5`) and strobe frequency/duty (`0xAB`/`0xAC`, defaults 10 Hz / 50 %) — so values your app persists permanently change the no-app magnet-tap programs (e.g. a persisted 12 BPM or 17 Hz strobe becomes the new Program 1/3 behavior). `[0xBF, 0x00]` (factory reset, [§4.3](#43-control-characteristic-0xff01--command-opcodes)) restores the defaults.
+**Both versions.**
 
-Hold the magnet closed **≥ 5 s** for deep sleep. (On relay-enabled builds, 5 short taps also trigger "forget earclip" — see [§4.7](#47-the-edge-as-relay).)
+> The behaviors above are **factory defaults**, not fixed program properties. Standalone programs render from the same NVS-persisted parameters the opcodes write — breathe rate/shape (`0xB1`/`0xB2`/`0xB5`) and strobe frequency/duty (`0xAB`/`0xAC`, defaults 10 Hz / 50 %) — so values your app persists permanently change the no-app behavior (e.g. a persisted 12 BPM becomes the new standalone breathe rate). On fw ≥ 4.17.0 this is formalized: a slot field of `0` explicitly means "inherit the persisted global" ([§4.1.3](#413-programming-the-standalone-slots-fw--4170)). `[0xBF, 0x00]` (factory reset, [§4.3](#43-control-characteristic-0xff01--command-opcodes)) restores the defaults — including, on 4.17.0+, wiping the slot table and disabling the cycle.
 
-> ⚠️ **Magnet gestures are NOT disabled while a client is connected** — only OTA mode suspends gesture handling. A short tap (0.15–4 s) mid-session unconditionally cycles the program, overwriting your app's lens mode (e.g. a static feedback duty becomes program 2 = 10 Hz breathe+strobe), and a ≥ 5 s hold deep-sleeps the device and drops the connection. In reconnect UX, tell users to tap **only after** the device is confirmed absent from scans ([§2.5](#25-reconnection)/[§7.2](#72-windows--winrt--python-bleak-gotchas)) — a tap during a transient link drop, or while another client holds the connection, changes the running program or sleeps the device. Apps that care about lens state should watch the `led_mode` byte (offset 20) of the 1 Hz `0xF3` health frame ([§4.4.4](#444-health-telemetry-0xf3--22-b)) to detect an external takeover and re-assert their mode — noting `led_mode`/`led_duty` exist only on the 22-byte frame (late glasses fw 4.15.3+; older firmware emits the 20-byte form without them, [§9.3](#93-firmware-featureversion-matrix)).
+Hold the magnet closed **≥ 5 s** for deep sleep — measured from the debounced close, so the device sleeps ≈ 5.05 s after the arm shuts, **while still held** (the wearer does not re-open the arm to trigger it). The 5 s must be continuous: a dropout restarts the count. (On relay-enabled builds, 5 short taps also trigger "forget earclip" — see [§4.7](#47-the-edge-as-relay). That gesture still works on 4.17.0+ even with the program cycle disabled.)
+
+> ⚠️ **Magnet gestures are NOT disabled while a client is connected** — only OTA mode suspends gesture handling.
+>
+> - **A ≥ 5 s hold deep-sleeps the device and drops the connection, on every firmware version.**
+> - **fw ≤ 4.16.3:** a short tap (0.15–4 s) mid-session unconditionally cycles the standalone program, overwriting your app's lens mode — e.g. a static feedback duty becomes program 2, a 10 Hz breathe+strobe.
+> - **fw ≥ 4.17.0:** a short tap is inert **unless** the app enabled the cycle via `0xBC`. If you enable it you re-introduce exactly the mid-session takeover above — so leave it off for app-driven sessions, or expect taps to fight your writes.
+>
+> In reconnect UX, tell users to tap **only after** the device is confirmed absent from scans ([§2.5](#25-reconnection)/[§7.2](#72-windows--winrt--python-bleak-gotchas)) — on any version a tap during a transient link drop, or while another client holds the connection, risks sleeping the device. Apps that care about lens state should watch the `led_mode` byte (offset 20) of the 1 Hz `0xF3` health frame ([§4.4.4](#444-health-telemetry-0xf3--22-b)) to detect an external takeover and re-assert their mode — noting `led_mode`/`led_duty` exist only on the 22-byte frame (late glasses fw 4.15.3+; older firmware emits the 20-byte form without them, [§9.3](#93-firmware-featureversion-matrix)).
+
+#### 4.1.3 Programming the standalone slots (fw ≥ 4.17.0)
+
+The magnet-tap cycle is a table of **up to 5 slots** plus a **count** of how many the tap cycles. Both live in the glasses' NVS and survive power cycles and disconnects. On firmware < 4.17.0 all three opcodes below are unknown and silently ignored — gate on the version ([§9.3](#93-firmware-featureversion-matrix)), because a silently-ignored write is indistinguishable from a successful one.
+
+**Default state on every unit:** count = 1, slot 0 all zeros. That renders as Breathe at the persisted `0xB1` rate, and the tap does nothing. A device that has never been programmed needs no migration write from you.
+
+| Opcode | Wire | Persisted |
+|---|---|---|
+| `0xBC` | `[0xBC][count]` — `0`/`1` = cycle **off** (default), `2`–`5` = tap cycles that many slots | yes (NVS) |
+| `0xBD` | `[0xBD][slot][mode][bpm][inhale][dhz_lo][dhz_hi][duty][brightness]` — 9 B, `slot` 0-based | yes (NVS) |
+| `0xBE` | `[0xBE][0x00]` — request readback → a `0xFC` frame on `0xFF03` ([§4.4.13](#4413-standalone-program-config-0xfc--44-b)) | n/a |
+
+**Slot fields.** `mode` is required; **every numeric field treats `0` as "inherit the persisted global"**:
+
+| Field | Range | `0` inherits from | Notes |
+|---|---|---|---|
+| `mode` | 0–3 | *(not optional)* | `0` Breathe · `1` Breathe+Strobe · `2` Strobe · `3` Static tint |
+| `bpm` | 1–30 | `0xB1` (default 6) | |
+| `inhale` | 10–90 | `0xB2` (default 40) | % of cycle spent inhaling |
+| `dhz` (u16 LE) | 10–500 | `0xAB` (default 100 = 10.0 Hz) | strobe rate in **deci-Hz** |
+| `duty` | 10–90 | `0xAC` (default 50) | strobe dark fraction |
+| `brightness` | 1–100 | `0xA2` (default 100) | max tint. For `mode = 3` this **is** the static tint level |
+
+Prefer sending `0` over echoing the current global: an inheriting slot automatically tracks later `0xB1`/`0xA2`/… writes, whereas a pinned value silently overrides them. Non-zero out-of-range values are **clamped, not rejected** — read back with `0xBE` to see what stuck.
+
+> ⚠️ **Write all slots before writing the count.** Writing `0xBC` first briefly enables the tap cycle over slots that have not been written yet. And remember `0xBD` alone does **not** enable anything — the cycle is off until `0xBC` says otherwise.
+
+Applying a slot writes the live parameter globals but does **not** persist them, so cycling through slots never rewrites the user's saved `0xB1`/`0xA2`/… values. Writing the slot the device is currently running re-applies it immediately, which makes `0xBD` usable as a live preview. Slot selection itself is **not** persisted: every power-on lands on slot 0.
+
+```python
+# Three standalone programs: breathe (inherit everything) / breathe+strobe 5 BPM / 10 Hz strobe.
+SLOTS = [
+    (0, 0, 0,  0,  0,   0),    # Breathe, all inherited  == the factory default
+    (1, 5, 40, 100, 50, 80),   # Breathe+Strobe, 5 BPM, 10.0 Hz, 50 % duty, 80 % tint
+    (2, 0, 0,  100, 50, 100),  # Strobe, 10.0 Hz, 50 % duty, full tint
+]
+
+for i, (mode, bpm, inhale, dhz, duty, brightness) in enumerate(SLOTS):
+    await send_cmd(client, 0xBD, i, mode, bpm, inhale,
+                   dhz & 0xFF, dhz >> 8, duty, brightness)
+await send_cmd(client, 0xBC, len(SLOTS))   # enable the cycle LAST
+await send_cmd(client, 0xBE, 0x00)         # read back -> 0xFC frame
+```
+
+To turn the cycle back off without losing the table, write `[0xBC, 0x01]`. To wipe it entirely, `[0xBF, 0x00]` (factory reset).
 
 #### 4.1.2 Session auto-sleep — the `0xA4` timer
 
@@ -856,7 +921,10 @@ Most commands are a 2-byte write `[opcode, arg]`. The firmware **never sends a G
 | `0xB8` | Coherence difficulty | 0–3 | yes | Legacy pipeline: easy / medium / hard / expert |
 | `0xB9` | Adaptive pacer | 0/1 | yes | Legacy pipeline |
 | `0xBA` | **Breathe sync** | 3 B payload | no | App-side lens phase-lock (fw ≥ 4.15.5). 4 B on the wire: `[0xBA][cycle_ms:u16 LE][inhale_pct:u8]`. Valid `cycle_ms` 2000–30000 ms (2–30 s per breath) and `inhale_pct` 10–90; out-of-range values are silently clamped (no NACK), so a cycle above 30 s renders at 30 s and will drift against your app clock. Restarts the `LED_MODE_BREATHE` cosine at the moment of the write (= your app's inhale boundary) and renders at the exact cycle length sent, so the glasses lens, an on-screen breathing cue, and an audio chime can share one clock. **Send ONLY at the breath-cycle boundary, never mid-breath** — full rationale in [§4.6.5](#465-phase-sync--the-one-rule-write-only-at-the-breath-boundary). Send it at each boundary and on connect/session start. A firmware lens slew-rate limiter fades any re-anchor (~250 ms) so resyncs never snap. Auto-expires 2 cycles after the last sync (reverts to the integer-BPM `0xB1` rate). Ignored by firmware < 4.15.5 (unknown opcode), so it's safe to always send. |
-| `0xBF` | Factory reset | any | n/a | wipes the persisted-settings NVS namespace |
+| `0xBC` | **Standalone program count** | 0–5 | yes (NVS) | fw ≥ 4.17.0, older fw ignores. The on/off switch for the magnet-tap program cycle: `0`/`1` = off (one program, tap does nothing — the default on every unit), `2`–`5` = a tap cycles that many slots. Out-of-range args are clamped to 5. If the count drops below the running slot index the firmware falls back to slot 0, so the lens can never be stranded on a program the tap can't reach. See [§4.1.3](#413-programming-the-standalone-slots-fw--4170). |
+| `0xBD` | **Standalone slot write** | 8 B payload | yes (NVS) | fw ≥ 4.17.0, older fw ignores. 9 B on the wire: `[0xBD][slot][mode][bpm][inhale][dhz:u16 LE][duty][brightness]`. `slot` is 0-based and must be < 5; **every numeric field takes `0` = inherit the persisted global**. Malformed writes (short, or slot ≥ 5) are dropped with a `0xF1` log line. Does **not** enable the cycle — that's `0xBC`. Full field table in [§4.1.3](#413-programming-the-standalone-slots-fw--4170). |
+| `0xBE` | **Standalone config read** | `0x00` | n/a | fw ≥ 4.17.0, older fw ignores (no frame arrives — treat a ~2 s timeout as "unsupported"). Replies with a `0xFC` frame on `0xFF03` carrying the count, the firmware's slot limit, the running slot, and all 5 slot records ([§4.4.13](#4413-standalone-program-config-0xfc--44-b)). **The only config readback the Edge offers** — every other setting is write-only. |
+| `0xBF` | Factory reset | any | n/a | wipes the persisted-settings NVS namespace (on fw ≥ 4.17.0 this includes the standalone slot table and count → back to one Breathe program with the tap inert) |
 | `0xC0` | *(reserved)* | — | — | Listed in the firmware's internal opcode comment table but has no dispatcher case — do not use |
 | `0xC1` | Forget earclip | any (ignored) | no | Relay control ([§4.7](#47-the-edge-as-relay)) — inert on stock builds. Wipes the stored earclip pairing, drops the central connection, starts a fresh scan. Visual feedback: 3 fast lens pulses. Same effect as 5 short magnet taps. |
 | `0xC3` | Relay config write | 50 B payload | no | Relay control — inert on stock builds. Bytes after the opcode are forwarded as a CONFIG_WRITE to the paired earclip — but the glasses firmware ships the **v3-era `NARBIS_CONFIG_WIRE_SIZE = 50`** and forwards exactly 50 B. ⚠️ **Known version mismatch:** current earclip firmware expects the 74-B config v4 payload ([§3.6](#36-the-runtime-config-struct)), so `0xC3` must not be used until the glasses relay is rebuilt against config v4 — write earclip config via a direct earclip connection instead ([§5](#5-configuring-the-earclip)). The earclip replies via CONFIG notify, which the Edge re-emits as a `0xF4` frame. |
@@ -916,6 +984,7 @@ The Edge multiplexes several packet types onto the same characteristic, distingu
 | `0xF9` | event-driven (~1 Hz per beat) | 5 B | Relayed earclip IBI (binary) — see §4.4.10 |
 | `0xFA` | every 1000 ms | 7 B | Link-quality telemetry (RSSI, MTU, drops) — see §4.4.11 |
 | `0xFB` | event-driven (`0xC7` poll) | 5 B | Glasses battery status — mv / soc / charging (fw ≥ 4.16.1, V1.2+ hardware) — see §4.4.12 |
+| `0xFC` | on demand (`0xBE` request) | 44 B | Standalone program config — count / limit / active slot / 5 slot records (fw ≥ 4.17.0) — see §4.4.13 |
 | `0x01`–`0x08` | event-driven | 1–7 B | OTA status — see §6 |
 
 Always subscribe to `0xFF03` **before** sending any OTA opcode, otherwise you'll miss the READY / PAGE_CRC / ERROR responses you need to drive the protocol. The relay frames `0xF4`–`0xFA` are delivered on this same characteristic, so a single subscription covers everything. (The relay frames only fire on relay-enabled builds — [§4.7](#47-the-edge-as-relay).)
@@ -1139,6 +1208,57 @@ def parse_glasses_battery(data: bytes):
     }
 ```
 
+#### 4.4.13 Standalone program config (`0xFC`) — 44 B
+
+**fw ≥ 4.17.0.** The reply to a `[0xBE, 0x00]` request ([§4.1.3](#413-programming-the-standalone-slots-fw--4170)) — and the **only configuration readback the Edge offers**. Every other persisted setting is write-only, so this is the one case where you can render the device's real state instead of a mirrored "last known" value.
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 1 | `0xFC` | Type byte |
+| 1 | 1 | `count` | Slots the magnet tap cycles. **`1` = cycle off** (one program), 2–5 = cycles that many |
+| 2 | 1 | `max` | Slots this firmware supports (5 today) — **read it, don't hardcode**; the frame length is `4 + 8 × max` |
+| 3 | 1 | `active` | 0-based index of the slot running right now (not persisted — always 0 after a power cycle) |
+| 4 | 8 × `max` | `slots[]` | Slot records, see below |
+
+Each 8-byte slot record — the same field order `0xBD` takes:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | `mode` — 0 Breathe · 1 Breathe+Strobe · 2 Strobe · 3 Static tint |
+| 1 | 1 | `bpm` (`0` = inherit `0xB1`) |
+| 2 | 1 | `inhale_pct` (`0` = inherit `0xB2`) |
+| 3 | 2 | `strobe_dhz` u16 LE, deci-Hz (`0` = inherit `0xAB`) |
+| 5 | 1 | `duty_pct` (`0` = inherit `0xAC`) |
+| 6 | 1 | `brightness` (`0` = inherit `0xA2`) |
+| 7 | 1 | reserved (`0`) |
+
+> ⚠️ **The read and write slot layouts differ by one byte.** A `0xFC` slot **record is 8 B** — it carries the trailing reserved byte. The `0xBD` **write payload is 7 B** (`[0xBD][slot]` + 7 = **9 B** on the wire) and has **no** reserved byte. Echoing a record straight back into a `0xBD` write produces a 10-byte frame; the firmware happens to tolerate it (it only checks `len >= 9` and reads the first 7 payload bytes), but do not rely on that — strip byte 7 when round-tripping.
+
+> **No frame arrives on firmware < 4.17.0** — `0xBE` is an unknown opcode there and is silently dropped. Treat a ~2 s timeout as "this firmware has no standalone slot table," not as an error.
+
+Python:
+
+```python
+def parse_standalone_config(data: bytes):
+    count, max_slots, active = data[1], data[2], data[3]   # data[0] == 0xFC
+    slots = []
+    for i in range(max_slots):
+        o = 4 + i * 8
+        if len(data) < o + 8:
+            break                                          # short frame — stop, don't guess
+        mode, bpm, inhale, dhz, duty, brightness = struct.unpack_from('<BBBHBB', data, o)
+        slots.append({
+            'mode':       mode,
+            'bpm':        bpm or None,                     # None = inherits the persisted global
+            'inhale_pct': inhale or None,
+            'strobe_dhz': dhz or None,
+            'duty_pct':   duty or None,
+            'brightness': brightness or None,
+        })
+    return {'count': count, 'max': max_slots, 'active': active,
+            'cycle_enabled': count > 1, 'slots': slots}
+```
+
 ### 4.5 PPG stream characteristic `0xFF04`
 
 > **Not emitted on current firmware (4.15.6+)** — the on-glasses PPG front-end is removed; subscribing yields silence. Layout kept for reference (it may return on future hardware).
@@ -1255,7 +1375,7 @@ connect  →  [0xA4, 0x3C]  (60-min session guard)  →  loop: [0xA5, duty]
 >
 > The SDK `FeedbackStream` exposes this split directly: `feed()` / `feed_reward()` for the proportional stream, `reward_event(duty, hold_ms)` for an immediate, tick-bypassing discrete reward that preempts the stream (waiting at most one in-flight write).
 
-> **On connect** the lens is already running a standalone program until your first write takes over — normally Breathe at the **NVS-persisted** `0xB1` rate (factory default 6 BPM; a previous client's setting survives, [§4.3](#43-control-characteristic-0xff01--command-opcodes)), or a strobe program if a magnet tap already cycled it ([§4.1.1](#411-standalone-programs--magnet-gestures)). Don't treat "6 BPM breathe" as a connect-time invariant.
+> **On connect** the lens is already running a standalone program until your first write takes over — normally Breathe at the **NVS-persisted** `0xB1` rate (factory default 6 BPM; a previous client's setting survives, [§4.3](#43-control-characteristic-0xff01--command-opcodes)). On fw ≤ 4.16.3 it may instead be a strobe program if a magnet tap already cycled it; on fw ≥ 4.17.0 that only happens if an app previously programmed a strobe slot **and** enabled the cycle ([§4.1.1](#411-standalone-programs--magnet-gestures)). Don't treat "6 BPM breathe" as a connect-time invariant on any version — on 4.17.0+ you can actually check, with `[0xBE, 0x00]` ([§4.4.13](#4413-standalone-program-config-0xfc--44-b)).
 >
 > **`0xA5` vs `0xA2` — decoupled in fw 4.16.2.** On **fw ≥ 4.16.2** they are cleanly separated: `0xA5` is a static-duty write that goes through `lens_apply_static(duty)` and does **NOT** touch `brightness` or any other program, while `0xA2` **solely** owns the persistent `brightness` (the max-tint that multiplies breathe/strobe/coherence depth). Stream `0xA5` for real-time dimming freely — it no longer disturbs your breathe depth or leaves other programs clear. (Boot also self-heals a persisted `brightness` of 0.) On **fw ≤ 4.16.1** the two shared one `brightness` variable: `0xA5` set it without persisting and `0xA2` set + persisted it, so the last streamed `0xA5` value became the breathe **depth**, and streaming static dimming to 0 left `brightness = 0` — rendering all *other* programs clear until you re-sent `0xA2`.
 
@@ -2007,7 +2127,9 @@ button.addEventListener('click', async () => {
 | Client stuck at BATCHED notify cadence even after writing PEER_ROLE | Wrote PEER_ROLE *after* enabling notifies | Re-order: write `[0x01]` to PEER_ROLE first, then subscribe to IBI |
 | Earclip CONFIG read returns 74 B but parser expects 50 B (or 58 B) | Parser stuck on an older `config_version` | Branch on `config_version` (offset 0): `≤2` legacy 56-B struct, `3` 48-B struct, `4` 72-B struct. The first 48 bytes of v3 and v4 are identical, so a v3-only parser can read everything it knows from a v4 frame by ignoring bytes 48..71 |
 | Health telemetry `ble_send_errors` climbing | Device notifications failing to send (congested/degraded link) — the counter tracks failed device→client NOTIFY sends, not client writes | Check link quality/RSSI and connection interval; ensure the client is connected and subscribed and the link isn't saturated |
-| Lens mode changes mid-session without any app write (e.g. sudden 10 Hz strobing) | A magnet tap cycled the standalone program — gestures stay live while a client is connected ([§4.1.1](#411-standalone-programs--magnet-gestures)) | Watch `led_mode` (byte 20) in the 1 Hz `0xF3` frame to detect the takeover and re-assert your mode; instruct users not to tap the magnet mid-session |
+| Lens mode changes mid-session without any app write (e.g. sudden 10 Hz strobing) | A magnet tap cycled the standalone program — gestures stay live while a client is connected ([§4.1.1](#411-standalone-programs--magnet-gestures)). **On fw ≥ 4.17.0 a tap is inert unless an app enabled the cycle with `0xBC`**, so if you see this on 4.17.0+, something enabled it — check with `[0xBE, 0x00]` | Watch `led_mode` (byte 20) in the 1 Hz `0xF3` frame to detect the takeover and re-assert your mode; instruct users not to tap the magnet mid-session. On 4.17.0+ prefer `[0xBC, 0x01]` to disable the cycle for app-driven sessions |
+| Magnet tap does nothing on a 4.17.0+ unit (no program change, no pulse) | **Expected** — one standalone program is configured, so the tap is a no-op by design ([§4.1.1](#411-standalone-programs--magnet-gestures)). Only a ≥ 5 s hold (sleep) still responds | Nothing to fix. If you *want* tap-to-cycle, program slots with `0xBD` and enable with `[0xBC, N]` ([§4.1.3](#413-programming-the-standalone-slots-fw--4170)) |
+| `0xBD`/`0xBC` writes appear to succeed but nothing changes | Firmware < 4.17.0 silently ignores unknown opcodes — there is no NACK | Gate on the version from the `0xF1` hello line ([§9.3](#93-firmware-featureversion-matrix)); confirm support by sending `[0xBE, 0x00]` and requiring a `0xFC` frame within ~2 s |
 | Earclip `firmware_revision` reads as an empty string | Read attempted before service discovery settled | Read DIS strings after the connection is fully established, not immediately on connect |
 | RAW_PPG never fires | `data_format` is `IBI_ONLY` | Write MODE to set `data_format = 1` or `2` |
 | Lens visibly "steps" on at low feedback values | The duty→opacity floor: duty 1 is already visibly tinted | Map your signal onto `1..100` knowing 0→1 is a hard step ([§4.6.4](#464-lens-opacity-is-not-linear--the-dutyopacity-floor-fw--4154)) |
@@ -2106,6 +2228,8 @@ OTA — Shared between Edge and Earclip (same UUIDs)
 | Glasses battery over BLE — `0x180F` / `0x2A19`, `0xFB` status frame, `0xC7` poll | 4.16.1 (V1.2+ hardware) | not exposed — no glasses battery over BLE |
 | Program-1 startup pulse silenced (only programs 2+ pulse on change) | 4.16.1 | program 1 also pulsed once on change |
 | `0xA5` clean static write — does not touch `brightness` / other programs | 4.16.2 | `0xA5` shared the `brightness` variable with `0xA2`; static dimming to 0 left other programs clear |
+| Standalone programs: single Breathe program, magnet tap inert by default | 4.17.0 | tap cycles three fixed programs (breathe / breathe+strobe / strobe) — reachable by accident |
+| Programmable standalone slot table + readback (`0xBC` / `0xBD` / `0xBE` → `0xFC`) | 4.17.0 | ignored (unknown opcodes); no `0xFC` frame arrives, and no config readback exists on any earlier version |
 | Write-without-response on `0xFF01` (higher-rate real-time streaming) | 4.16.3 | `0xFF01` is write-with-response only — control writes need an ATT round-trip (paces streaming to ~20/sec even with optimized connection params) |
 | `0xBA` breathe-sync | 4.15.5 | ignored (unknown opcode) |
 | `0xB0 0x01` breathe+strobe | 4.15.6 | plain breathe |

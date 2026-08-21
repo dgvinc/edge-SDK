@@ -219,6 +219,9 @@ Simple byte-based protocol for direct integration. Service `0x00FF`, control cha
 | Breathe hold-bottom | `[0xB4, n]` | 0-50 × 100 ms (persisted) |
 | Breathe waveform | `[0xB5, w]` | 0 sine / 1 linear (persisted) |
 | Breathe sync | `[0xBA, cycle_lo, cycle_hi, inhale_pct]` | Phase-lock; send at breath boundary only |
+| Standalone program count | `[0xBC, count]` | fw ≥ 4.17.0. Magnet-tap cycle: 0/1 = off (default), 2–5 = cycle N |
+| Standalone slot write | `[0xBD, slot, …]` | fw ≥ 4.17.0. 9 B; every numeric field 0 = inherit |
+| Standalone config read | `[0xBE, 0x00]` | fw ≥ 4.17.0. Replies with a `0xFC` frame on `0xFF03` |
 | Factory reset | `[0xBF, 0x00]` | Reset persisted settings |
 
 **Important:** every opcode command must be at least 2 bytes — a 1-byte write is always interpreted as the legacy opacity command. Pad argument-less opcodes with `0x00`.
@@ -236,7 +239,28 @@ Full protocol (including OTA and legacy opcodes): [Protocol reference](docs/blue
 
 ### Standalone programs
 
-The glasses work without any app. A short magnet tap (0.15-4 s) on the temple cycles through three sensor-free programs; the lens signals the new program with N slow fade-dark pulses:
+The glasses work without any app. **This changed substantially in firmware 4.17.0** — gate any UX copy on the version.
+
+**fw ≥ 4.17.0.** There is exactly one standalone program out of the box: breathe at the persisted rate (6 BPM by default). Opening the temple arm starts it; **a short tap does nothing.** Holding the magnet closed ≥ 5 s still sleeps the device.
+
+Programs 2 and 3 are gone from the default cycle — nothing standalone strobes unless an app programs it. The old cycle was reachable by accident: folding an arm and re-opening it dropped wearers into a 10 Hz strobe they never asked for.
+
+Firmware still supports a tap cycle over a programmable table of up to 5 slots, off until an app enables it:
+
+```python
+from edge_glasses import StandaloneProgram, StandaloneMode
+
+await glasses.set_standalone_programs([
+    StandaloneProgram(),                                       # breathe, inherits everything
+    StandaloneProgram(StandaloneMode.BREATHE_STROBE, bpm=5),
+    StandaloneProgram(StandaloneMode.STROBE, strobe_hz=10.0),
+])
+cfg = await glasses.get_standalone_config()   # None on fw < 4.17.0
+```
+
+Every numeric slot field defaults to **inherit the persisted global**, so an all-default slot *is* the factory program. `[0xBC, 0x01]` turns the cycle back off without losing the table. Full wire format: [protocol §4.1.3](docs/bluetooth-protocol.md).
+
+**fw ≤ 4.16.3.** A short magnet tap (0.15–4 s) cycles three fixed sensor-free programs; the lens signals the new one with N slow fade-dark pulses (program 1 silent on fw ≥ 4.16.1):
 
 | Program | Behavior |
 |---------|----------|
@@ -244,7 +268,7 @@ The glasses work without any app. A short magnet tap (0.15-4 s) on the temple cy
 | 2 — Breathe + Strobe | 10 Hz strobe, dark-phase duty modulated by the breathing waveform |
 | 3 — Strobe | Plain 10 Hz strobe |
 
-Hold the magnet closed ≥ 5 s for deep sleep.
+Hold the magnet closed ≥ 5 s for deep sleep, on every version.
 
 ### Preset sessions
 

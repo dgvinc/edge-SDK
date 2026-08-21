@@ -4,7 +4,9 @@ EDGE Glasses - Main SDK module
 Targets glasses firmware 4.15.6+ (device name ``Narbis_Edge``).
 The lens-config methods (set_lens_smoothing / set_lens_max_rate /
 set_disconnect_behavior) need firmware 4.15.7+; older firmware ignores
-them, so they are always safe to call.
+them, so they are always safe to call. The standalone-program methods
+(set_standalone_programs / get_standalone_config) need firmware 4.17.0+;
+older firmware ignores the writes and never answers the read.
 
 All biofeedback processing runs app-side: the glasses are a display.
 Configure and start the firmware's breathe / static / strobe renderer,
@@ -12,9 +14,10 @@ or stream legacy opacity writes for continuous feedback.
 """
 
 import asyncio
+import struct
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional, List
+from typing import Optional, List, Sequence
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
@@ -31,6 +34,10 @@ SERVICE_UUID = "000000ff-0000-1000-8000-00805f9b34fb"
 CHAR_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
 DEVICE_NAME = "Narbis_Edge"
 
+# Status notification characteristic - type-tagged frames, byte 0 = type.
+# Used here only for the 0xFC standalone-config readback (firmware >= 4.17.0).
+STATUS_CHAR_UUID = "0000ff03-0000-1000-8000-00805f9b34fb"
+
 # Standard BLE Battery Service (firmware >= 4.16.1 on V1.2+ hardware)
 BATTERY_SERVICE_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
 BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
@@ -40,6 +47,86 @@ class Waveform(IntEnum):
     """Breathe waveform shape (opcode 0xB5)"""
     SINE = 0
     LINEAR = 1
+
+
+class StandaloneMode(IntEnum):
+    """
+    What a standalone program slot renders (opcode 0xBD, byte ``mode``)
+
+    Standalone programs are what the glasses run with no app connected,
+    selected by the magnet/temple-arm gesture. Firmware >= 4.17.0 only.
+    """
+    BREATHE = 0
+    BREATHE_STROBE = 1
+    STROBE = 2
+    STATIC = 3
+
+
+# Firmware's slot limit. get_standalone_config() reports the device's own
+# ``max``; prefer that over this constant when rendering a UI.
+STANDALONE_MAX_PROGRAMS = 5
+
+
+@dataclass
+class StandaloneProgram:
+    """
+    One standalone program slot (firmware >= 4.17.0)
+
+    Every field except ``mode`` is optional, and ``None`` means **inherit
+    the value already persisted on the glasses** - the firmware encodes
+    that as 0. Prefer inheriting: an inheriting slot automatically tracks
+    later set_brightness() / start_breathe() writes, while a pinned value
+    silently overrides them.
+
+    ``StandaloneProgram()`` with no arguments is a plain breathe program
+    that inherits everything - which is exactly the factory default.
+    """
+    mode: StandaloneMode = StandaloneMode.BREATHE
+    bpm: Optional[int] = None             # 1-30
+    inhale_pct: Optional[int] = None      # 10-90
+    strobe_hz: Optional[float] = None     # 1.0-50.0, 0.1 Hz resolution
+    duty_pct: Optional[int] = None        # 10-90
+    brightness: Optional[int] = None      # 1-100; for STATIC this IS the tint
+
+    def to_bytes(self) -> bytes:
+        """Pack the 7 payload bytes that follow ``[0xBD][slot]``."""
+        dhz = 0 if self.strobe_hz is None else max(10, min(500, round(self.strobe_hz * 10)))
+        return struct.pack(
+            "<BBBHBB",
+            int(self.mode) & 0xFF,
+            0 if self.bpm is None else max(1, min(30, int(self.bpm))),
+            0 if self.inhale_pct is None else max(10, min(90, int(self.inhale_pct))),
+            dhz,
+            0 if self.duty_pct is None else max(10, min(90, int(self.duty_pct))),
+            0 if self.brightness is None else max(1, min(100, int(self.brightness))),
+        )
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> "StandaloneProgram":
+        """Unpack one 8-byte slot record from a 0xFC frame (byte 7 reserved)."""
+        mode, bpm, inhale, dhz, duty, brightness = struct.unpack_from("<BBBHBB", raw, 0)
+        return cls(
+            mode=StandaloneMode(mode) if mode in set(StandaloneMode) else StandaloneMode.BREATHE,
+            bpm=bpm or None,
+            inhale_pct=inhale or None,
+            strobe_hz=(dhz / 10.0) if dhz else None,
+            duty_pct=duty or None,
+            brightness=brightness or None,
+        )
+
+
+@dataclass
+class StandaloneConfig:
+    """Whole standalone configuration as read back by get_standalone_config()"""
+    count: int                          # slots the magnet tap cycles; 1 = cycle off
+    max_slots: int                      # slots this firmware supports
+    active: int                         # 0-based index of the slot running now
+    slots: List[StandaloneProgram]
+
+    @property
+    def cycle_enabled(self) -> bool:
+        """True when a magnet tap actually changes program (count > 1)"""
+        return self.count > 1
 
 
 @dataclass
@@ -611,8 +698,172 @@ class Glasses:
         await self._send(bytes([0xA7, 0x00]))
 
     async def factory_reset(self) -> None:
-        """Reset all NVS-persisted settings to factory defaults (0xBF)"""
+        """
+        Reset all NVS-persisted settings to factory defaults (0xBF)
+
+        On firmware >= 4.17.0 this also wipes the standalone program table
+        and disables the magnet-tap cycle, returning the glasses to a single
+        breathe program at 6 BPM.
+        """
         await self._send(bytes([0xBF, 0x00]))
+
+    # -------------------------------------------------------------------------
+    # Standalone programs (firmware >= 4.17.0)
+    # -------------------------------------------------------------------------
+    # What the glasses run with NO app connected, selected by the magnet /
+    # temple-arm gesture.
+    #
+    # Out of the box there is exactly one standalone program - breathe at the
+    # persisted rate - and a short tap does nothing. Programming more than one
+    # slot and enabling the cycle re-arms tap-to-switch, which also means a
+    # stray tap can take the lens away from your app mid-session. Leave the
+    # cycle off for app-driven sessions.
+
+    async def set_standalone_count(self, count: int) -> None:
+        """
+        Enable or disable the magnet-tap program cycle (0xBC)
+
+        Args:
+            count: 0 or 1 disables the cycle (one program, tap does nothing -
+                the default on every unit). 2-5 makes a short tap cycle that
+                many slots. Values above the firmware limit are clamped by
+                the device.
+
+        Note:
+            Persisted to NVS. Firmware < 4.17.0 ignores this silently.
+            Write your slots BEFORE raising the count - see
+            set_standalone_programs(), which orders it for you.
+        """
+        await self._send(bytes([0xBC, max(0, min(255, int(count)))]))
+
+    async def set_standalone_program(self, slot: int, program: StandaloneProgram) -> None:
+        """
+        Write one standalone program slot (0xBD)
+
+        Args:
+            slot: 0-based slot index (0 is the program every power-on lands on)
+            program: the slot definition; ``None`` fields inherit the
+                persisted globals
+
+        Note:
+            Persisted to NVS immediately. Writing the slot that is currently
+            running re-applies it, so this doubles as a live preview. This
+            does NOT enable the tap cycle - that is set_standalone_count().
+            Firmware < 4.17.0 ignores this silently.
+        """
+        slot = max(0, min(STANDALONE_MAX_PROGRAMS - 1, int(slot)))
+        # 9 B total: [0xBD][slot] + 7 payload bytes. Note the asymmetry with
+        # the 0xFC readback, whose slot records are 8 B (trailing reserved
+        # byte) - the write form has no reserved byte.
+        wire = bytes([0xBD, slot]) + program.to_bytes()
+        assert len(wire) == 9, len(wire)
+        await self._send(wire)
+
+    async def set_standalone_programs(
+        self,
+        programs: Sequence[StandaloneProgram],
+        enable_cycle: bool = True,
+    ) -> None:
+        """
+        Write a whole standalone program set and enable the tap cycle
+
+        Writes every slot first, then the count - the correct order, because
+        raising the count first would briefly let a tap land on slots that
+        have not been written yet.
+
+        Args:
+            programs: 1-5 slot definitions, in the order the tap cycles them
+            enable_cycle: when True (default) a tap cycles ``len(programs)``
+                programs. Pass False to store the set but leave the tap inert
+                (count 1) - useful for staging a configuration the user has
+                not switched on yet.
+
+        Raises:
+            ValueError: if ``programs`` is empty or longer than the limit
+
+        Example:
+            await glasses.set_standalone_programs([
+                StandaloneProgram(),                                        # breathe, inherits all
+                StandaloneProgram(StandaloneMode.BREATHE_STROBE, bpm=5),    # breathe+strobe @ 5 BPM
+                StandaloneProgram(StandaloneMode.STROBE, strobe_hz=10.0),   # plain 10 Hz strobe
+            ])
+        """
+        if not programs:
+            raise ValueError("need at least one standalone program")
+        if len(programs) > STANDALONE_MAX_PROGRAMS:
+            raise ValueError(
+                f"at most {STANDALONE_MAX_PROGRAMS} standalone programs "
+                f"(got {len(programs)})"
+            )
+        for i, program in enumerate(programs):
+            await self.set_standalone_program(i, program)
+        await self.set_standalone_count(len(programs) if enable_cycle else 1)
+
+    async def get_standalone_config(self, timeout: float = 2.0) -> Optional[StandaloneConfig]:
+        """
+        Read the standalone program configuration back off the device (0xBE)
+
+        The only configuration readback the glasses offer - every other
+        persisted setting is write-only, so this is the one case where a UI
+        can show the device's real state instead of a mirrored "last known"
+        value.
+
+        Args:
+            timeout: seconds to wait for the 0xFC reply frame
+
+        Returns:
+            A StandaloneConfig, or ``None`` if no reply arrived - which on
+            this protocol means the firmware is older than 4.17.0 (unknown
+            opcodes are dropped silently, there is no NACK). Treat ``None``
+            as "this firmware has no standalone slot table," not as an error.
+
+        Example:
+            cfg = await glasses.get_standalone_config()
+            if cfg is None:
+                print("firmware predates 4.17.0 - no slot table")
+            elif not cfg.cycle_enabled:
+                print("one program; a magnet tap does nothing")
+            else:
+                print(f"{cfg.count} programs, running #{cfg.active + 1}")
+        """
+        if not self.is_connected:
+            raise ConnectionError("Not connected. Call connect() first.")
+
+        loop = asyncio.get_running_loop()
+        future: "asyncio.Future[bytes]" = loop.create_future()
+
+        def on_status(_char, data: bytearray) -> None:
+            if data and data[0] == 0xFC and not future.done():
+                future.set_result(bytes(data))
+
+        try:
+            await self._client.start_notify(STATUS_CHAR_UUID, on_status)
+        except BleakError as e:
+            raise CommandError(f"Could not subscribe to status characteristic: {e}")
+
+        try:
+            await self._send(bytes([0xBE, 0x00]))
+            try:
+                frame = await asyncio.wait_for(future, timeout)
+            except asyncio.TimeoutError:
+                return None    # firmware < 4.17.0 - opcode silently dropped
+        finally:
+            try:
+                await self._client.stop_notify(STATUS_CHAR_UUID)
+            except BleakError:
+                pass           # link already gone; nothing useful to do
+
+        if len(frame) < 4:
+            return None
+        count, max_slots, active = frame[1], frame[2], frame[3]
+        slots = []
+        for i in range(max_slots):
+            offset = 4 + i * 8
+            if len(frame) < offset + 8:
+                break          # short frame - stop rather than guess
+            slots.append(StandaloneProgram.from_bytes(frame[offset:offset + 8]))
+        return StandaloneConfig(count=count, max_slots=max_slots,
+                                active=active, slots=slots)
 
     # -------------------------------------------------------------------------
     # Battery (firmware >= 4.16.1 on V1.2+ hardware)
