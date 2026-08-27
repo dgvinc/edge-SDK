@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- No Bluetooth stack required: this one runs on any .NET 8 platform. -->
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Narbis.EdgeGlasses.Examples.BringYourOwnBle</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Narbis.EdgeGlasses\Narbis.EdgeGlasses.csproj" />
+  </ItemGroup>
+
+</Project>

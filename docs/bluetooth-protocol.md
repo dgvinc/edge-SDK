@@ -1,6 +1,6 @@
 # Narbis Bluetooth Protocol — SDK Integration Reference
 
-> **Audience.** Developers speaking the wire protocol directly — **Python** (via [bleak](https://github.com/hbldh/bleak)) or **JavaScript** (via Web Bluetooth) — whether you're using the edge-SDK libraries or bypassing them. Everything a client needs to talk to the **Narbis Edge** glasses and the **Narbis Earclip** over BLE is in this document.
+> **Audience.** Developers speaking the wire protocol directly — **Python** (via [bleak](https://github.com/hbldh/bleak)), **JavaScript** (via Web Bluetooth), or **C / C++ / C#** (via WinRT or your own GATT stack) — whether you're using the edge-SDK libraries or bypassing them. Code samples below are Python and JS; the C, C++ and C# SDKs emit byte-identical frames (verified by a shared golden-vector test), so every wire sequence here applies unchanged. Everything a client needs to talk to the **Narbis Edge** glasses and the **Narbis Earclip** over BLE is in this document.
 >
 > **Provenance.** Synced to glasses firmware **4.16.3+** and earclip firmware **config v4** — August 2026.
 >
@@ -10,7 +10,7 @@
 >
 > **Pairing/bonding:** neither device requires encryption or bonding.
 >
-> **SDK docs.** If you'd rather use the shipped libraries: [Firmware API reference](../firmware/API_REFERENCE.md) · [Python SDK API](../python-SDK/docs/API_REFERENCE.md) · [JS SDK](../js-SDK/README.md).
+> **SDK docs.** If you'd rather use the shipped libraries: [Firmware API reference](../firmware/API_REFERENCE.md) · [Python SDK API](../python-SDK/docs/API_REFERENCE.md) · [JS SDK](../js-SDK/README.md) · [C/C++ SDK](../cpp-SDK/README.md) · [C# SDK](../csharp-SDK/README.md).
 
 ---
 
@@ -1235,7 +1235,7 @@ The primary third-party integration pattern: your software produces a feedback v
 > The firmware is **never** the bottleneck: it applies each commanded static duty on its 10 ms tick (**100 Hz internally, no command throttling**). The **BLE link** is the limit, and it depends on the negotiated connection parameters:
 > - The glasses **request** a 20–30 ms interval with slave latency 1. A host that accepts those defaults sustains only **~8–11 writes/sec** (measured: real glasses, fw 4.16.2, Windows laptop).
 > - A host that **requests throughput-optimized / low-latency connection parameters** (e.g. WinRT `RequestPreferredConnectionParameters(ThroughputOptimized)`, held for the session) reaches **~20 writes/sec sustained** (measured: median 31 ms/write, 20.8/sec).
-> - The **hard ceiling** is the connection-event rate (~33–50/sec at a 20–30 ms interval). Reaching the full **30–50 Hz** band uses firmware **write-without-response on `0xFF01`**, available on **fw ≥ 4.16.3** (older firmware is write-with-response only, which paces you to ~20/sec even with optimized connection params). On ≥ 4.16.3, feature-detect the `0xFF01` write-without-response property and stream duty writes without per-write acks. **The Python/JS SDK `FeedbackStream` does this automatically** — it detects the property at connect and uses write-without-response transparently (check `glasses.supports_fast_write` / `glasses.supportsFastWrite`).
+> - The **hard ceiling** is the connection-event rate (~33–50/sec at a 20–30 ms interval). Reaching the full **30–50 Hz** band uses firmware **write-without-response on `0xFF01`**, available on **fw ≥ 4.16.3** (older firmware is write-with-response only, which paces you to ~20/sec even with optimized connection params). On ≥ 4.16.3, feature-detect the `0xFF01` write-without-response property and stream duty writes without per-write acks. **Every shipped SDK's `FeedbackStream` does this automatically** — it detects the property at connect and uses write-without-response transparently (check `glasses.supports_fast_write` (Python/C++) / `glasses.supportsFastWrite` (JS) / `glasses.SupportsFastWrite` (C#); in C, `edge_glasses_supports_fast_write()`).
 >
 > **Recommended: set 30–50 Hz as a configurable target with coalescing on**, so the effective rate self-limits to your data rate. Since feedback sources typically produce ≤ 16–30 new values/sec, coalesced writes rarely hit the ceiling anyway. Per-update latency is ~20–60 ms BLE transport + < 100 ms lens switch.
 >

@@ -6,6 +6,8 @@ Open-source smart LCD glasses for meditation, neurofeedback, and biofeedback app
 ![Platform](https://img.shields.io/badge/platform-ESP32-green.svg)
 ![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
 ![TypeScript](https://img.shields.io/badge/typescript-5.0+-blue.svg)
+![C++](https://img.shields.io/badge/C%2B%2B-17-blue.svg)
+![C#](https://img.shields.io/badge/.NET-standard%202.0%20%7C%208.0-blue.svg)
 
 ## What is EDGE?
 
@@ -33,7 +35,7 @@ EDGE glasses feature LCD lenses that dynamically change opacity via Bluetooth. A
 
 - **Open Protocol** — Simple BLE API, no vendor lock-in
 - **Low Latency** — ~20–60 ms write-to-lens transport; streams real-time feedback at a configurable 30–50 Hz target
-- **Cross-Platform SDKs** — Python for research, JS for web apps
+- **Cross-Platform SDKs** — Python for research, JS for web apps, C/C++ and C# for native desktop and clinical software
 - **Sensor Agnostic** — Works with any biosignal source via LSL/brainflow
 - **Research Ready** — Compatible with OpenBCI, Muse, Polar, and lab equipment
 
@@ -55,6 +57,8 @@ EDGE glasses feature LCD lenses that dynamically change opacity via Bluetooth. A
 | [Protocol reference](docs/bluetooth-protocol.md) | Standalone BLE protocol reference — both devices, all frames, OTA, legacy opcodes (in this repo) |
 | [python-SDK/](python-SDK/) | Python SDK with OpenBCI/Muse/Polar examples |
 | [js-SDK/](js-SDK/) | JavaScript/TypeScript SDK for web apps |
+| [cpp-SDK/](cpp-SDK/) | C++17 SDK with a flat C API and a Windows (WinRT) Bluetooth transport |
+| [csharp-SDK/](csharp-SDK/) | C# / .NET SDK (netstandard2.0, net472, net8.0-windows) |
 
 ## Quick Start
 
@@ -147,6 +151,61 @@ await glasses.setDuration(60);                 // session guard
 const stream = glasses.startFeedbackStream();  // 30 Hz writer -- coalesces + serializes for you
 onFeedback((v) => stream.feedReward(v));       // push your 0..1 feedback value, any callback, any rate
 ```
+
+### C#
+```bash
+# Not yet on NuGet - reference the project directly:
+dotnet add reference path/to/edge-SDK/csharp-SDK/src/Narbis.EdgeGlasses/Narbis.EdgeGlasses.csproj
+```
+
+```csharp
+using Narbis.EdgeGlasses;
+
+using var glasses = new Glasses(new WinRtBleTransport());
+await glasses.ConnectAsync();
+await glasses.SetDurationAsync(60);                       // session guard
+FeedbackStream stream = glasses.StartFeedbackStream();    // 30 Hz writer -- coalesces + serializes for you
+myPipeline.OnUpdate += v => stream.FeedReward(v);         // push your 0..1 feedback value, any thread, any rate
+```
+
+Targets `netstandard2.0`, `net472` and `net8.0-windows`, so it drops into
+classic WinForms/WPF applications as readily as into .NET 8.
+
+### C++
+```cmake
+add_subdirectory(cpp-SDK)
+target_link_libraries(my_app PRIVATE edge::glasses)
+```
+
+```cpp
+#include "edge/feedback_stream.hpp"
+#include "edge/winrt_transport.hpp"
+
+edge::WinRtTransport transport;
+edge::Glasses glasses(&transport);
+glasses.connect();
+glasses.set_duration(60);                             // session guard
+auto stream = glasses.start_feedback_stream();        // 30 Hz writer
+stream->feed_reward(value);                           // 0..1, any thread, any rate
+```
+
+### C
+```c
+#include "edge/edge_glasses.h"
+
+edge_glasses g;
+edge_glasses_create_winrt(&g);
+edge_glasses_connect(g, 10000);
+edge_glasses_set_duration(g, 60);                     /* session guard */
+edge_stream s;
+edge_glasses_start_feedback_stream(g, 30.0, &s);
+edge_stream_feed_reward(s, value);                    /* 0..1, any thread, any rate */
+```
+
+Already have your own Bluetooth stack? Both the C and C++ SDKs work as a pure
+protocol encoder — `edge_frame_set_static(buf, sizeof buf, 50)` hands you the
+exact bytes to write, with no BLE dependency at all. Same for C# via
+`Protocol.SetStatic(50)`.
 
 Drop-in example: [screen_dimmer.py](python-SDK/examples/screen_dimmer.py). The on-board breathe engine and fixed-parameter sessions are there when a protocol calls for paced breathing:
 
@@ -277,6 +336,8 @@ For breathing entrainment, prefer the on-board breathe engine (configure, start,
 - [Integration Guide](python-SDK/docs/INTEGRATION_GUIDE.md) — OpenBCI, Muse, Polar, LSL setup
 - [Python SDK Docs](python-SDK/README.md)
 - [JavaScript SDK Docs](js-SDK/README.md)
+- [C/C++ SDK Docs](cpp-SDK/README.md)
+- [C# SDK Docs](csharp-SDK/README.md)
 
 ## Community
 

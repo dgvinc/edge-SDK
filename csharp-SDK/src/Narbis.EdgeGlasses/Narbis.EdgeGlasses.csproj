@@ -1,0 +1,77 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    EDGE Glasses .NET SDK
+
+    Target frameworks:
+      netstandard2.0                  core, no BLE stack - bring your own transport.
+                                      Consumable from .NET Framework 4.6.1+, .NET Core,
+                                      Mono and Unity.
+      net472                          the same core for classic WinForms/WPF apps.
+      net8.0-windows10.0.19041.0      core + the built-in WinRT Bluetooth transport.
+
+    A .NET Framework app that wants the built-in Bluetooth transport can opt in
+    with -p:EdgeEnableWinRt=true, which pulls in Microsoft.Windows.SDK.Contracts
+    and compiles WinRtBleTransport for net472 as well.
+  -->
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;net472;net8.0-windows10.0.19041.0</TargetFrameworks>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningsNotAsErrors></WarningsNotAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+
+    <AssemblyName>Narbis.EdgeGlasses</AssemblyName>
+    <RootNamespace>Narbis.EdgeGlasses</RootNamespace>
+    <Version>2.5.0</Version>
+    <Authors>Narbis</Authors>
+    <Company>Narbis</Company>
+    <Product>EDGE Smart Glasses SDK</Product>
+    <Description>
+      C# SDK for Narbis EDGE smart glasses. Drive the electrochromic lens over BLE for
+      neurofeedback and biofeedback: real-time opacity streaming (the wearable
+      screen-dimmer pattern), the on-board breathe and strobe renderers, and discrete
+      operant rewards.
+    </Description>
+    <PackageId>Narbis.EdgeGlasses</PackageId>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/narbiscorp/edge-SDK</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/narbiscorp/edge-SDK</RepositoryUrl>
+    <PackageTags>ble;bluetooth;glasses;neurofeedback;biofeedback;eeg;hrv;narbis;edge</PackageTags>
+  </PropertyGroup>
+
+  <!-- The WinRT transport needs the Windows Runtime projection. -->
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net8.0-windows10.0.19041.0'">
+    <DefineConstants>$(DefineConstants);EDGE_WINRT</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net472' AND '$(EdgeEnableWinRt)' == 'true'">
+    <DefineConstants>$(DefineConstants);EDGE_WINRT</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net472' AND '$(EdgeEnableWinRt)' == 'true'">
+    <PackageReference Include="Microsoft.Windows.SDK.Contracts" Version="10.0.19041.1" />
+  </ItemGroup>
+
+  <!-- Reference assemblies so net472 builds on machines without Visual Studio. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net472'">
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3"
+                      PrivateAssets="All" />
+  </ItemGroup>
+
+  <!-- Excluded unless a Windows Runtime projection is available. -->
+  <ItemGroup Condition="!$(DefineConstants.Contains('EDGE_WINRT'))">
+    <Compile Remove="WinRtBleTransport.cs" />
+  </ItemGroup>
+
+  <!-- The test suite exercises internal helpers (address parsing, clamping). -->
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>Narbis.EdgeGlasses.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+</Project>

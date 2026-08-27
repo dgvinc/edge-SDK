@@ -5,7 +5,7 @@
 
 This is the **wire / opcode reference** for the Narbis Edge glasses: every BLE command, its bytes, ranges, and on-device behavior. You can drive the glasses directly from raw BLE with only this document.
 
-- Prefer a library? The **[Python SDK](../python-SDK/README.md)** and **[JS SDK](../js-SDK/README.md)** wrap every opcode here in a named method — the opcode ↔ method map is in [§ SDK method map](#sdk-method-map).
+- Prefer a library? The **[Python](../python-SDK/README.md)**, **[JS](../js-SDK/README.md)**, **[C/C++](../cpp-SDK/README.md)** and **[C#](../csharp-SDK/README.md)** SDKs wrap every opcode here in a named method — the opcode ↔ method map is in [§ SDK method map](#sdk-method-map).
 - Need the status/PPG notification frames, the OTA flow, or the earclip? Those live in the full **[protocol doc](../docs/bluetooth-protocol.md)** — this file is glasses-control only.
 
 ---
@@ -121,7 +121,7 @@ The core integration: map any protocol's feedback value to lens tint — a weara
 
 **Discrete reward** (reinforce the instant a contingency is met — operant conditioning): don't wait for your streaming loop's next tick — send `[0xA5, duty]` (typically `[0xA5, 0]` = clear) immediately. `0xA5` applies with no smoothing by default, so reward latency is just ~20–60 ms BLE transport + a < 100 ms lens switch, bounded by your upstream analysis window, not the streaming rate. (If you have enabled `0xA0`/`0xA1`, those deliberately stretch the transition — leave them off for minimum-latency rewards.)
 
-> Both patterns are built into the SDKs' `FeedbackStream` (`feed()`/`feed_reward()` for the stream, `reward_event()` for immediate discrete rewards). See the [Python](../python-SDK/README.md) / [JS](../js-SDK/README.md) READMEs.
+> Both patterns are built into every SDK's `FeedbackStream` (`feed()`/`feed_reward()` for the stream, `reward_event()` for immediate discrete rewards). See the [Python](../python-SDK/README.md) / [JS](../js-SDK/README.md) / [C&nbsp;·&nbsp;C++](../cpp-SDK/README.md) / [C#](../csharp-SDK/README.md) READMEs.
 
 ---
 
@@ -277,25 +277,30 @@ Parameters marked "persisted" survive sleep and power cycles (NVS); `0xBF` resto
 
 ## SDK method map
 
-| Opcode | Python (`edge_glasses`) | JavaScript (`edge-glasses`) |
-|--------|--------------------------|------------------------------|
-| *(1 byte)* opacity | `set_opacity(0-255)` / `clear()` / `dark()` | `setOpacity` / `clear` / `dark` |
-| `0xA0` | `set_lens_smoothing(ms)` | `setLensSmoothing(ms)` |
-| `0xA1` | `set_lens_max_rate(pct_per_100ms)` | `setLensMaxRate(pctPer100ms)` |
-| `0xA2` | `set_brightness(0-100)` | `setBrightness` |
-| `0xA3` | `set_disconnect_behavior(fail_clear)` | `setDisconnectBehavior(failClear)` |
-| `0xA4` | `set_duration(1-60)` | `setDuration` |
-| `0xA5` | `set_static(0-100)` | `setStatic` |
-| `0xA6` | `start_strobe(hz?, duty_pct?)` | `startStrobe` |
-| `0xA7` | `sleep()` | `sleep` |
-| `0xAB`/`0xAC` | `set_strobe_frequency` / `set_strobe_duty` | `setStrobeFrequency` / `setStrobeDuty` |
-| `0xB0`–`0xB5` | `start_breathe(...)` | `startBreathe({...})` |
-| `0xBA` | `sync_breath(cycle_ms, inhale_pct)` | `syncBreath(cycleMs, inhalePct)` |
-| `0xBF` | `factory_reset()` | `factoryReset()` |
-| `0xC7` / `0x2A19` | `get_battery()` → 0-100 or `None` | `getBattery()` → 0-100 or `null` |
-| (WNR fast path) | `supports_fast_write` / `_stream_static()` | `supportsFastWrite` / `streamStatic()` |
-| real-time stream | `start_feedback_stream()` → `FeedbackStream` | `startFeedbackStream()` → `FeedbackStream` |
-| real-time stream | `start_feedback_stream()` → `FeedbackStream` | `startFeedbackStream()` → `FeedbackStream` |
+| Opcode | Python (`edge_glasses`) | JavaScript (`edge-glasses`) | C# (`Narbis.EdgeGlasses`) |
+|--------|--------------------------|------------------------------|----------------------------|
+| *(1 byte)* opacity | `set_opacity(0-255)` / `clear()` / `dark()` | `setOpacity` / `clear` / `dark` | `SetOpacityAsync` / `ClearAsync` / `DarkAsync` |
+| `0xA0` | `set_lens_smoothing(ms)` | `setLensSmoothing(ms)` | `SetLensSmoothingAsync(ms)` |
+| `0xA1` | `set_lens_max_rate(pct_per_100ms)` | `setLensMaxRate(pctPer100ms)` | `SetLensMaxRateAsync(pctPer100Ms)` |
+| `0xA2` | `set_brightness(0-100)` | `setBrightness` | `SetBrightnessAsync` |
+| `0xA3` | `set_disconnect_behavior(fail_clear)` | `setDisconnectBehavior(failClear)` | `SetDisconnectBehaviorAsync(failClear)` |
+| `0xA4` | `set_duration(1-60)` | `setDuration` | `SetDurationAsync` |
+| `0xA5` | `set_static(0-100)` | `setStatic` | `SetStaticAsync` |
+| `0xA6` | `start_strobe(hz?, duty_pct?)` | `startStrobe` | `StartStrobeAsync(hz?, dutyPct?)` |
+| `0xA7` | `sleep()` | `sleep` | `SleepAsync()` |
+| `0xAB`/`0xAC` | `set_strobe_frequency` / `set_strobe_duty` | `setStrobeFrequency` / `setStrobeDuty` | `SetStrobeFrequencyAsync` / `SetStrobeDutyAsync` |
+| `0xB0`–`0xB5` | `start_breathe(...)` | `startBreathe({...})` | `StartBreatheAsync(BreatheOptions)` |
+| `0xBA` | `sync_breath(cycle_ms, inhale_pct)` | `syncBreath(cycleMs, inhalePct)` | `SyncBreathAsync(cycleMs, inhalePct)` |
+| `0xBF` | `factory_reset()` | `factoryReset()` | `FactoryResetAsync()` |
+| `0xC7` / `0x2A19` | `get_battery()` → 0-100 or `None` | `getBattery()` → 0-100 or `null` | `GetBatteryAsync()` → `int?` |
+| (WNR fast path) | `supports_fast_write` / `_stream_static()` | `supportsFastWrite` / `streamStatic()` | `SupportsFastWrite` / `StreamStaticAsync()` |
+| real-time stream | `start_feedback_stream()` → `FeedbackStream` | `startFeedbackStream()` → `FeedbackStream` | `StartFeedbackStream()` → `FeedbackStream` |
+
+**C++ and C** follow from the Python column mechanically, so they are omitted above:
+
+- **C++** (`edge::Glasses`) uses the identical snake_case names — `set_static(50)`, `start_feedback_stream()`, `get_battery()`.
+- **C** prefixes them: `edge_glasses_set_static(g, 50)`, `edge_stream_feed_reward(s, v)`.
+- Both also expose the opcode table as **pure frame builders** with no BLE dependency — `edge::protocol::set_static(50)` / `edge_frame_set_static(buf, sizeof buf, 50)` — for applications that already own their GATT stack. C# has the same in `Protocol.SetStatic(50)`.
 
 ---
 
