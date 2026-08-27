@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      Targets the Windows TFM so the tests run against the exact assembly that
+      includes WinRtBleTransport. The Bluetooth calls themselves need hardware
+      and are not exercised here; its pure helpers are.
+    -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>Narbis.EdgeGlasses.Tests</AssemblyName>
+    <RootNamespace>Narbis.EdgeGlasses.Tests</RootNamespace>
+    <!-- Matches the library: enables the WinRtBleTransport helper tests. -->
+    <DefineConstants>$(DefineConstants);EDGE_WINRT</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Narbis.EdgeGlasses\Narbis.EdgeGlasses.csproj" />
+  </ItemGroup>
+
+</Project>

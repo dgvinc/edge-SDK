@@ -1,4 +1,27 @@
+# Python
 __pycache__/
 *.pyc
+
+# JavaScript
 node_modules/
 dist/
+
+# C / C++
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.lib
+*.dll
+*.pdb
+*.ilk
+cpp-SDK/build/
+
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
