@@ -14,8 +14,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
-#include <sstream>
 #include <thread>
 
 #include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
@@ -30,7 +30,6 @@
 namespace edge {
 namespace {
 
-namespace wf = winrt::Windows::Foundation;
 namespace wdb = winrt::Windows::Devices::Bluetooth;
 namespace wdba = winrt::Windows::Devices::Bluetooth::Advertisement;
 namespace wdbg = winrt::Windows::Devices::Bluetooth::GenericAttributeProfile;
@@ -106,41 +105,49 @@ WinRtTransport::~WinRtTransport() { disconnect(); }
 std::vector<ScanResult> WinRtTransport::scan(int timeout_ms) {
     ensure_apartment();
 
-    std::mutex found_mutex;
-    std::vector<ScanResult> found;
+    // Shared, not captured by reference: the watcher delivers callbacks on a
+    // background thread, and revoking the handler does not guarantee an
+    // in-flight one has already returned. Owning the state through a shared_ptr
+    // keeps it alive even if a late callback lands after this function returns.
+    struct ScanState {
+        std::mutex mutex;
+        std::vector<ScanResult> found;
+    };
+    auto state = std::make_shared<ScanState>();
 
     wdba::BluetoothLEAdvertisementWatcher watcher;
     // Active scanning picks up scan-response payloads, where the complete local
     // name often lives.
     watcher.ScanningMode(wdba::BluetoothLEScanningMode::Active);
 
-    const auto token = watcher.Received([&](wdba::BluetoothLEAdvertisementWatcher const&,
-                                            wdba::BluetoothLEAdvertisementReceivedEventArgs const&
-                                                args) {
-        const auto name = winrt::to_string(args.Advertisement().LocalName());
-        if (name != kDeviceName) return;  // exact match: the service UUID is not advertised
+    const auto token = watcher.Received(
+        [state](wdba::BluetoothLEAdvertisementWatcher const&,
+                wdba::BluetoothLEAdvertisementReceivedEventArgs const& args) {
+            const auto name = winrt::to_string(args.Advertisement().LocalName());
+            if (name != kDeviceName) return;  // exact match: the service UUID is not advertised
 
-        const std::string addr = format_address(args.BluetoothAddress());
-        std::lock_guard<std::mutex> lock(found_mutex);
-        for (auto& existing : found) {
-            if (existing.address == addr) {
-                existing.rssi = args.RawSignalStrengthInDBm();
-                return;
+            const std::string addr = format_address(args.BluetoothAddress());
+            std::lock_guard<std::mutex> lock(state->mutex);
+            for (auto& existing : state->found) {
+                if (existing.address == addr) {
+                    existing.rssi = args.RawSignalStrengthInDBm();
+                    return;
+                }
             }
-        }
-        ScanResult r;
-        r.name = name;
-        r.address = addr;
-        r.rssi = args.RawSignalStrengthInDBm();
-        found.push_back(r);
-    });
+            ScanResult r;
+            r.name = name;
+            r.address = addr;
+            r.rssi = args.RawSignalStrengthInDBm();
+            state->found.push_back(r);
+        });
 
     watcher.Start();
     std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms));
     watcher.Stop();
     watcher.Received(token);
 
-    std::lock_guard<std::mutex> lock(found_mutex);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    std::vector<ScanResult> found = state->found;
     std::sort(found.begin(), found.end(),
               [](const ScanResult& a, const ScanResult& b) { return a.rssi > b.rssi; });
     return found;
@@ -157,7 +164,9 @@ void WinRtTransport::set_address(const std::string& address) {
         throw ConnectionError("not a valid BLE address: '" + address +
                              "' (expected AA:BB:CC:DD:EE:FF)");
     }
-    impl_->address_text = address;
+    // Store the normalised form, so address() reads back consistently whether it
+    // was set here or discovered by a scan (matches the C# transport).
+    impl_->address_text = format_address(value);
     impl_->address_value = value;
     impl_->has_address = true;
 }

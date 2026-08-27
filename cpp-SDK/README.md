@@ -143,7 +143,7 @@ ctest --test-dir cpp-SDK/build --output-on-failure
 
 | CMake option | Default | Effect |
 |---|---|---|
-| `EDGE_WITH_WINRT` | `ON` under MSVC, else `OFF` | Build the Windows BLE transport. Requires MSVC and Windows SDK 10.0.19041+; C++/WinRT is not available under MinGW or GCC. |
+| `EDGE_WITH_WINRT` | `ON` under MSVC, else `OFF` | Build the Windows BLE transport. Requires MSVC and Windows SDK 10.0.19041+; C++/WinRT is not available under MinGW or GCC. Verified against VS 2022 Build Tools with SDK 10.0.22621. |
 | `EDGE_BUILD_TESTS` | `ON` | Build the three test binaries. |
 | `EDGE_BUILD_EXAMPLES` | `ON` | Build the examples. |
 | `EDGE_BUILD_SHARED` | `OFF` | Build a DLL instead of a static library. |
@@ -278,6 +278,13 @@ Three suites, no external test framework:
 ```bash
 ctest --test-dir cpp-SDK/build --output-on-failure
 ```
+
+Verified on two toolchains, so the SDK is not accidentally tied to either:
+
+| Toolchain | Covers |
+|---|---|
+| MSVC 19.44 (VS 2022 Build Tools) + Windows SDK 10.0.22621, `/W4 /permissive-` | The whole library **including `winrt_transport.cpp`**, plus every test and example. Warning-clean. |
+| GCC 15.2, `-Wall -Wextra -Wpedantic` | Everything except the WinRT transport, which is MSVC-only by nature. Warning-clean. |
 
 | Test | What it covers |
 |---|---|
